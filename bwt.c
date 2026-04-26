@@ -162,10 +162,77 @@ void bwt_2occ(const bwt_t *bwt, bwtint_t k, bwtint_t l, ubyte_t c, bwtint_t *ok,
 	}
 }
 
-#define __occ_aux4(bwt, b)											\
-	((bwt)->cnt_table[(b)&0xff] + (bwt)->cnt_table[(b)>>8&0xff]		\
-	 + (bwt)->cnt_table[(b)>>16&0xff] + (bwt)->cnt_table[(b)>>24])
+#if defined(__ARM_NEON) && defined(OPT_BWT_OCC4_NEON)
+static inline uint32_t __occ_aux4_neon(uint32_t b)
+{
+	uint32_t low  = b & 0x55555555u;
+	uint32_t high = (b >> 1) & 0x55555555u;
+	uint32_t mask_A = (~low) & (~high) & 0x55555555u;
+	uint32_t mask_C = low & (~high) & 0x55555555u;
+	uint32_t mask_G = (~low) & high & 0x55555555u;
+	uint32_t mask_T = low & high & 0x55555555u;
+	uint32_t cnt_A = __builtin_popcount(mask_A);
+	uint32_t cnt_C = __builtin_popcount(mask_C);
+	uint32_t cnt_G = __builtin_popcount(mask_G);
+	uint32_t cnt_T = __builtin_popcount(mask_T);
+	return cnt_A | (cnt_C << 8) | (cnt_G << 16) | (cnt_T << 24);
+}
+#endif
 
+#define __occ_aux4(bwt, b)												((bwt)->cnt_table[(b)&0xff] + (bwt)->cnt_table[(b)>>8&0xff]			 + (bwt)->cnt_table[(b)>>16&0xff] + (bwt)->cnt_table[(b)>>24])
+
+/* Scalar reference using cnt_table lookup */
+void bwt_occ4_scalar(const bwt_t *bwt, bwtint_t k, bwtint_t cnt[4])
+{
+	bwtint_t x;
+	uint32_t *p, tmp, *end;
+	if (k == (bwtint_t)(-1)) {
+		memset(cnt, 0, 4 * sizeof(bwtint_t));
+		return;
+	}
+	k -= (k >= bwt->primary);
+	p = bwt_occ_intv(bwt, k);
+	memcpy(cnt, p, 4 * sizeof(bwtint_t));
+	p += sizeof(bwtint_t);
+	end = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4));
+	for (x = 0; p < end; ++p) x += __occ_aux4(bwt, *p);
+	tmp = *p & ~((1U<<((~k&15)<<1)) - 1);
+	x += __occ_aux4(bwt, tmp) - (~k&15);
+	cnt[0] += x&0xff; cnt[1] += x>>8&0xff; cnt[2] += x>>16&0xff; cnt[3] += x>>24;
+}
+
+void bwt_2occ4_scalar(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4])
+{
+	bwtint_t _k, _l;
+	_k = k - (k >= bwt->primary);
+	_l = l - (l >= bwt->primary);
+	if (_l>>OCC_INTV_SHIFT != _k>>OCC_INTV_SHIFT || k == (bwtint_t)(-1) || l == (bwtint_t)(-1)) {
+		bwt_occ4_scalar(bwt, k, cntk);
+		bwt_occ4_scalar(bwt, l, cntl);
+	} else {
+		bwtint_t x, y;
+		uint32_t *p, tmp, *endk, *endl;
+		k -= (k >= bwt->primary);
+		l -= (l >= bwt->primary);
+		p = bwt_occ_intv(bwt, k);
+		memcpy(cntk, p, 4 * sizeof(bwtint_t));
+		p += sizeof(bwtint_t);
+		endk = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4));
+		endl = p + ((l>>4) - ((l&~OCC_INTV_MASK)>>4));
+		for (x = 0; p < endk; ++p) x += __occ_aux4(bwt, *p);
+		y = x;
+		tmp = *p & ~((1U<<((~k&15)<<1)) - 1);
+		x += __occ_aux4(bwt, tmp) - (~k&15);
+		for (; p < endl; ++p) y += __occ_aux4(bwt, *p);
+		tmp = *p & ~((1U<<((~l&15)<<1)) - 1);
+		y += __occ_aux4(bwt, tmp) - (~l&15);
+		memcpy(cntl, cntk, 4 * sizeof(bwtint_t));
+		cntk[0] += x&0xff; cntk[1] += x>>8&0xff; cntk[2] += x>>16&0xff; cntk[3] += x>>24;
+		cntl[0] += y&0xff; cntl[1] += y>>8&0xff; cntl[2] += y>>16&0xff; cntl[3] += y>>24;
+	}
+}
+
+#if defined(__ARM_NEON) && defined(OPT_BWT_OCC4_NEON)
 void bwt_occ4(const bwt_t *bwt, bwtint_t k, bwtint_t cnt[4])
 {
 	bwtint_t x;
@@ -174,18 +241,17 @@ void bwt_occ4(const bwt_t *bwt, bwtint_t k, bwtint_t cnt[4])
 		memset(cnt, 0, 4 * sizeof(bwtint_t));
 		return;
 	}
-	k -= (k >= bwt->primary); // because $ is not in bwt
+	k -= (k >= bwt->primary);
 	p = bwt_occ_intv(bwt, k);
 	memcpy(cnt, p, 4 * sizeof(bwtint_t));
-	p += sizeof(bwtint_t); // sizeof(bwtint_t) = 4*(sizeof(bwtint_t)/sizeof(uint32_t))
-	end = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4)); // this is the end point of the following loop
-	for (x = 0; p < end; ++p) x += __occ_aux4(bwt, *p);
+	p += sizeof(bwtint_t);
+	end = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4));
+	for (x = 0; p < end; ++p) x += __occ_aux4_neon(*p);
 	tmp = *p & ~((1U<<((~k&15)<<1)) - 1);
-	x += __occ_aux4(bwt, tmp) - (~k&15);
+	x += __occ_aux4_neon(tmp) - (~k&15);
 	cnt[0] += x&0xff; cnt[1] += x>>8&0xff; cnt[2] += x>>16&0xff; cnt[3] += x>>24;
 }
 
-// an analogy to bwt_occ4() but more efficient, requiring k <= l
 void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4])
 {
 	bwtint_t _k, _l;
@@ -197,27 +263,36 @@ void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtin
 	} else {
 		bwtint_t x, y;
 		uint32_t *p, tmp, *endk, *endl;
-		k -= (k >= bwt->primary); // because $ is not in bwt
+		k -= (k >= bwt->primary);
 		l -= (l >= bwt->primary);
 		p = bwt_occ_intv(bwt, k);
 		memcpy(cntk, p, 4 * sizeof(bwtint_t));
-		p += sizeof(bwtint_t); // sizeof(bwtint_t) = 4*(sizeof(bwtint_t)/sizeof(uint32_t))
-		// prepare cntk[]
+		p += sizeof(bwtint_t);
 		endk = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4));
 		endl = p + ((l>>4) - ((l&~OCC_INTV_MASK)>>4));
-		for (x = 0; p < endk; ++p) x += __occ_aux4(bwt, *p);
+		for (x = 0; p < endk; ++p) x += __occ_aux4_neon(*p);
 		y = x;
 		tmp = *p & ~((1U<<((~k&15)<<1)) - 1);
-		x += __occ_aux4(bwt, tmp) - (~k&15);
-		// calculate cntl[] and finalize cntk[]
-		for (; p < endl; ++p) y += __occ_aux4(bwt, *p);
+		x += __occ_aux4_neon(tmp) - (~k&15);
+		for (; p < endl; ++p) y += __occ_aux4_neon(*p);
 		tmp = *p & ~((1U<<((~l&15)<<1)) - 1);
-		y += __occ_aux4(bwt, tmp) - (~l&15);
+		y += __occ_aux4_neon(tmp) - (~l&15);
 		memcpy(cntl, cntk, 4 * sizeof(bwtint_t));
 		cntk[0] += x&0xff; cntk[1] += x>>8&0xff; cntk[2] += x>>16&0xff; cntk[3] += x>>24;
 		cntl[0] += y&0xff; cntl[1] += y>>8&0xff; cntl[2] += y>>16&0xff; cntl[3] += y>>24;
 	}
 }
+#else
+void bwt_occ4(const bwt_t *bwt, bwtint_t k, bwtint_t cnt[4])
+{
+	bwt_occ4_scalar(bwt, k, cnt);
+}
+
+void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4])
+{
+	bwt_2occ4_scalar(bwt, k, l, cntk, cntl);
+}
+#endif
 
 int bwt_match_exact(const bwt_t *bwt, int len, const ubyte_t *str, bwtint_t *sa_begin, bwtint_t *sa_end)
 {
