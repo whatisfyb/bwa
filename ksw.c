@@ -566,11 +566,8 @@ int ksw_extend2_neon(int qlen, const uint8_t *query, int tlen, const uint8_t *ta
 
 #endif /* __ARM_NEON && OPT_KSW_EXTEND2_NEON */
 
-int ksw_extend2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int end_bonus, int zdrop, int h0, int *_qle, int *_tle, int *_gtle, int *_gscore, int *_max_off)
+int ksw_extend2_scalar(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int end_bonus, int zdrop, int h0, int *_qle, int *_tle, int *_gtle, int *_gscore, int *_max_off)
 {
-#if defined(__ARM_NEON) && defined(OPT_KSW_EXTEND2_NEON)
-	return ksw_extend2_neon(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, h0, _qle, _tle, _gtle, _gscore, _max_off);
-#else
 	eh_t *eh; // score array
 	int8_t *qp; // query profile
 	int i, j, k, oe_del = o_del + e_del, oe_ins = o_ins + e_ins, beg, end, max, max_i, max_j, max_ins, max_del, max_ie, gscore, max_off;
@@ -668,7 +665,15 @@ int ksw_extend2(int qlen, const uint8_t *query, int tlen, const uint8_t *target,
 	if (_gscore) *_gscore = gscore;
 	if (_max_off) *_max_off = max_off;
 	return max;
-#endif /* __ARM_NEON && OPT_KSW_EXTEND2_NEON */
+}
+
+int ksw_extend2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int end_bonus, int zdrop, int h0, int *_qle, int *_tle, int *_gtle, int *_gscore, int *_max_off)
+{
+#if defined(__ARM_NEON) && defined(OPT_KSW_EXTEND2_NEON)
+	return ksw_extend2_neon(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, h0, _qle, _tle, _gtle, _gscore, _max_off);
+#else
+	return ksw_extend2_scalar(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, h0, _qle, _tle, _gtle, _gscore, _max_off);
+#endif
 }
 
 int ksw_extend(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int w, int end_bonus, int zdrop, int h0, int *qle, int *tle, int *gtle, int *gscore, int *max_off)
