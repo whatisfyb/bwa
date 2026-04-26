@@ -413,8 +413,164 @@ typedef struct {
 	int32_t h, e;
 } eh_t;
 
+#if defined(__ARM_NEON) && defined(OPT_KSW_EXTEND2_NEON)
+
+int ksw_extend2_neon(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int end_bonus, int zdrop, int h0, int *_qle, int *_tle, int *_gtle, int *_gscore, int *_max_off)
+{
+	int32_t *H, *E;
+	int8_t *qp;
+	int i, j, k, oe_del = o_del + e_del, oe_ins = o_ins + e_ins, beg, end, max, max_i, max_j, max_ins, max_del, max_ie, gscore, max_off;
+	assert(h0 > 0);
+	qp = malloc(qlen * m);
+	H = calloc(qlen + 1, sizeof(int32_t));
+	E = calloc(qlen + 1, sizeof(int32_t));
+	for (k = i = 0; k < m; ++k) {
+		const int8_t *p = &mat[k * m];
+		for (j = 0; j < qlen; ++j) qp[i++] = p[query[j]];
+	}
+	H[0] = h0; H[1] = h0 > oe_ins? h0 - oe_ins : 0;
+	for (j = 2; j <= qlen && H[j-1] > e_ins; ++j)
+		H[j] = H[j-1] - e_ins;
+	k = m * m;
+	for (i = 0, max = 0; i < k; ++i)
+		max = max > mat[i]? max : mat[i];
+	max_ins = (int)((double)(qlen * max + end_bonus - o_ins) / e_ins + 1.);
+	max_ins = max_ins > 1? max_ins : 1;
+	w = w < max_ins? w : max_ins;
+	max_del = (int)((double)(qlen * max + end_bonus - o_del) / e_del + 1.);
+	max_del = max_del > 1? max_del : 1;
+	w = w < max_del? w : max_del;
+	max = h0, max_i = max_j = -1; max_ie = -1, gscore = -1;
+	max_off = 0;
+	beg = 0, end = qlen;
+	int32x4_t v_oe_del = vdupq_n_s32(oe_del);
+	int32x4_t v_e_del  = vdupq_n_s32(e_del);
+	int32x4_t v_oe_ins = vdupq_n_s32(oe_ins);
+	int32x4_t v_zero   = vdupq_n_s32(0);
+	for (i = 0; LIKELY(i < tlen); ++i) {
+		int32_t f = 0, h1, m_score = 0, mj = -1;
+		int8_t *q = &qp[target[i] * qlen];
+		if (beg < i - w) beg = i - w;
+		if (end > i + w + 1) end = i + w + 1;
+		if (end > qlen) end = qlen;
+		if (beg == 0) {
+			h1 = h0 - (o_del + e_del * (i + 1));
+			if (h1 < 0) h1 = 0;
+		} else h1 = 0;
+		/* NEON inner loop: vectorize H/E/M computation, F via vgetq_lane_s32
+		 * E has no column dependency -> fully parallel
+		 * M = H_diag + q[j] (parallel if H_diag > 0)
+		 * F has column dependency -> extract lanes in order via vgetq_lane_s32
+		 *   (register-to-register, no store-load through memory) */
+		j = beg;
+		for (; LIKELY(j + 3 < end); j += 4) {
+			int32x4_t vH_diag = vld1q_s32(&H[j]);
+			int32x4_t vE_old  = vld1q_s32(&E[j]);
+			int8x8_t  q8      = vld1_s8(&q[j]);
+			int16x8_t q16     = vmovl_s8(q8);
+			int32x4_t vq      = vmovl_s16(vget_low_s16(q16));
+			/* M = H_diag > 0 ? H_diag + q : 0 */
+			uint32x4_t v_nz   = vcgtq_s32(vH_diag, v_zero);
+			int32x4_t vM      = vbslq_s32(v_nz, vaddq_s32(vH_diag, vq), v_zero);
+			/* H = max(M, E, F) — F not yet merged, compute H_noF */
+			int32x4_t vH_noF  = vmaxq_s32(vM, vE_old);
+			/* E_new = max(M - oe_del, E_old - e_del, 0) */
+			int32x4_t vE_new  = vmaxq_s32(vsubq_s32(vE_old, v_e_del), vmaxq_s32(vsubq_s32(vM, v_oe_del), v_zero));
+			vst1q_s32(&E[j], vE_new);
+			/* F candidates from M: F_init = max(M - oe_ins, 0) */
+			int32x4_t vF_init = vmaxq_s32(vsubq_s32(vM, v_oe_ins), v_zero);
+			/* Merge F into H using vgetq_lane_s32 (register-to-register, no memory)
+			 * F has column dependency: F(j) = max(F(j-1)-e_ins, M(j)-oe_ins, 0)
+			 * We process lanes 0..3 in order, extracting from NEON registers directly */
+			int32_t h_lane, M_lane, f_cand;
+			M_lane = vgetq_lane_s32(vM, 0);
+			f_cand = vgetq_lane_s32(vF_init, 0);
+			f = f > f_cand? f : f_cand;
+			h_lane = vgetq_lane_s32(vH_noF, 0);
+			h_lane = h_lane > f? h_lane : f;
+			H[j]   = h1; h1 = h_lane;
+			mj = m_score > h1? mj : j;   m_score = m_score > h1? m_score : h1;
+			f -= e_ins;
+
+			M_lane = vgetq_lane_s32(vM, 1);
+			f_cand = vgetq_lane_s32(vF_init, 1);
+			f = f > f_cand? f : f_cand;
+			h_lane = vgetq_lane_s32(vH_noF, 1);
+			h_lane = h_lane > f? h_lane : f;
+			H[j+1] = h1; h1 = h_lane;
+			mj = m_score > h1? mj : j+1; m_score = m_score > h1? m_score : h1;
+			f -= e_ins;
+
+			M_lane = vgetq_lane_s32(vM, 2);
+			f_cand = vgetq_lane_s32(vF_init, 2);
+			f = f > f_cand? f : f_cand;
+			h_lane = vgetq_lane_s32(vH_noF, 2);
+			h_lane = h_lane > f? h_lane : f;
+			H[j+2] = h1; h1 = h_lane;
+			mj = m_score > h1? mj : j+2; m_score = m_score > h1? m_score : h1;
+			f -= e_ins;
+
+			M_lane = vgetq_lane_s32(vM, 3);
+			f_cand = vgetq_lane_s32(vF_init, 3);
+			f = f > f_cand? f : f_cand;
+			h_lane = vgetq_lane_s32(vH_noF, 3);
+			h_lane = h_lane > f? h_lane : f;
+			H[j+3] = h1; h1 = h_lane;
+			mj = m_score > h1? mj : j+3; m_score = m_score > h1? m_score : h1;
+			f -= e_ins;
+		}
+		/* Scalar tail for remaining <4 cells */
+		for (; LIKELY(j < end); ++j) {
+			int32_t h, M = H[j], e = E[j];
+			H[j] = h1;
+			M = M? M + q[j] : 0;
+			h = M > e? M : e;
+			h = h > f? h : f;
+			h1 = h;
+			mj = m_score > h? mj : j;
+			m_score = m_score > h? m_score : h;
+			e = e > M - oe_del? e : (M - oe_del > 0? M - oe_del : 0);
+			E[j] = e;
+			f = f > M - oe_ins? f : (M - oe_ins > 0? M - oe_ins : 0);
+			f -= e_ins;
+		}
+		H[end] = h1; E[end] = 0;
+		if (j == qlen) {
+			max_ie = gscore > h1? max_ie : i;
+			gscore = gscore > h1? gscore : h1;
+		}
+		if (m_score == 0) break;
+		if (m_score > max) {
+			max = m_score, max_i = i, max_j = mj;
+			max_off = max_off > abs(mj - i)? max_off : abs(mj - i);
+		} else if (zdrop > 0) {
+			if (i - max_i > mj - max_j) {
+				if (max - m_score - ((i - max_i) - (mj - max_j)) * e_del > zdrop) break;
+			} else {
+				if (max - m_score - ((mj - max_j) - (i - max_i)) * e_ins > zdrop) break;
+			}
+		}
+		for (j = beg; LIKELY(j < end) && H[j] == 0 && E[j] == 0; ++j);
+		beg = j;
+		for (j = end; LIKELY(j >= beg) && H[j] == 0 && E[j] == 0; --j);
+		end = j + 2 < qlen? j + 2 : qlen;
+	}
+	free(H); free(E); free(qp);
+	if (_qle) *_qle = max_j + 1;
+	if (_tle) *_tle = max_i + 1;
+	if (_gtle) *_gtle = max_ie + 1;
+	if (_gscore) *_gscore = gscore;
+	if (_max_off) *_max_off = max_off;
+	return max;
+}
+
+#endif /* __ARM_NEON && OPT_KSW_EXTEND2_NEON */
+
 int ksw_extend2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int end_bonus, int zdrop, int h0, int *_qle, int *_tle, int *_gtle, int *_gscore, int *_max_off)
 {
+#if defined(__ARM_NEON) && defined(OPT_KSW_EXTEND2_NEON)
+	return ksw_extend2_neon(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, end_bonus, zdrop, h0, _qle, _tle, _gtle, _gscore, _max_off);
+#else
 	eh_t *eh; // score array
 	int8_t *qp; // query profile
 	int i, j, k, oe_del = o_del + e_del, oe_ins = o_ins + e_ins, beg, end, max, max_i, max_j, max_ins, max_del, max_ie, gscore, max_off;
@@ -512,6 +668,7 @@ int ksw_extend2(int qlen, const uint8_t *query, int tlen, const uint8_t *target,
 	if (_gscore) *_gscore = gscore;
 	if (_max_off) *_max_off = max_off;
 	return max;
+#endif /* __ARM_NEON && OPT_KSW_EXTEND2_NEON */
 }
 
 int ksw_extend(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int w, int end_bonus, int zdrop, int h0, int *qle, int *tle, int *gtle, int *gscore, int *max_off)
