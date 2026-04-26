@@ -39,6 +39,10 @@
 #  include "malloc_wrap.h"
 #endif
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 int bwa_verbose = 3;
 int bwa_dbg = 0;
 char bwa_rg_id[256];
@@ -172,8 +176,37 @@ uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, 
 			cigar[0] = l_query<<4 | 0;
 			*n_cigar = 1;
 		}
+		#ifdef OPT7_NEON_SCORE
+		/* NEON score accumulation using vqtbl2q_u8 table lookup.
+		 * Processes 16 positions per iteration: computes rseq[i]*5+query[i]
+		 * as lookup index, then vqtbl2q_u8 fetches 16 scores from the 5x5
+		 * matrix (25 bytes fits in two 16-byte NEON lookup tables). */
+		{
+			int8_t min_val = 0;
+			for (int _i = 0; _i < 25; _i++)
+				if (mat[_i] < min_val) min_val = mat[_i];
+			uint8_t _shift = (uint8_t)(-min_val);
+			uint8_t tbl0[16], tbl1[16];
+			for (int _i = 0; _i < 16; _i++) tbl0[_i] = (uint8_t)(mat[_i] + _shift);
+			for (int _i = 0; _i < 9; _i++) tbl1[_i] = (uint8_t)(mat[16+_i] + _shift);
+			for (int _i = 9; _i < 16; _i++) tbl1[_i] = _shift;
+			uint8x16x2_t tbl = {{vld1q_u8(tbl0), vld1q_u8(tbl1)}};
+			int _total = 0; int _i = 0;
+			for (; _i + 16 <= l_query; _i += 16) {
+				uint8x16_t r = vld1q_u8(rseq + _i);
+				uint8x16_t q = vld1q_u8(query + _i);
+				uint8x16_t idx = vaddq_u8(vmulq_u8(r, vdupq_n_u8(5)), q);
+				uint8x16_t scores = vqtbl2q_u8(tbl, idx);
+				_total += (int)vaddvq_u8(scores) - 16 * (int)_shift;
+			}
+			for (; _i < l_query; _i++)
+				_total += mat[rseq[_i]*5 + query[_i]];
+			*score = _total;
+		}
+#else
 		for (i = 0, *score = 0; i < l_query; ++i)
 			*score += mat[rseq[i]*5 + query[i]];
+#endif
 	} else {
 		int w, max_gap, max_ins, max_del, min_w;
 		// set the band-width
