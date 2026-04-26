@@ -86,9 +86,26 @@ void bwt_cal_sa(bwt_t *bwt, int intv)
 bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 {
 	bwtint_t sa = 0, mask = bwt->sa_intv - 1;
+#ifdef OPT_BWT_PREFETCH
+	/* Prefetch the OCC block for the first bwt_invPsi iteration.
+	 * Each invPsi step calls bwt_occ → random DRAM access (~100ns).
+	 * Starting the prefetch early gives the memory subsystem a head start. */
+	{
+		bwtint_t pk = k - (k >= bwt->primary);
+		__builtin_prefetch(bwt_occ_intv(bwt, pk), 0, 1);
+	}
+#endif
 	while (k & mask) {
 		++sa;
 		k = bwt_invPsi(bwt, k);
+#ifdef OPT_BWT_PREFETCH
+		/* After each invPsi step, prefetch the OCC block for the next k.
+		 * k is now the new position; the next invPsi will need bwt_occ at k. */
+		if (k & mask) {
+			bwtint_t pk = k - (k >= bwt->primary);
+			__builtin_prefetch(bwt_occ_intv(bwt, pk), 0, 1);
+		}
+#endif
 	}
 	/* without setting bwt->sa[0] = -1, the following line should be
 	   changed to (sa + bwt->sa[k/bwt->sa_intv]) % (bwt->seq_len + 1) */
@@ -268,6 +285,19 @@ void bwt_extend(const bwt_t *bwt, const bwtintv_t *ik, bwtintv_t ok[4], int is_b
 		ok[i].x[!is_back] = bwt->L2[i] + 1 + tk[i];
 		ok[i].x[2] = tl[i] - tk[i];
 	}
+#ifdef OPT_BWT_PREFETCH
+	/* Prefetch OCC blocks for the next bwt_extend step.
+	 * After this call, ok[c] contains the next interval. The next
+	 * bwt_extend will access bwt_occ_intv at ok[c].x[!is_back] - 1,
+	 * which we can compute now and prefetch into L2 cache. */
+	for (i = 0; i != 4; ++i) {
+		if (ok[i].x[2] > 0) {
+			bwtint_t next_k = ok[i].x[!is_back] - 1;
+			next_k -= (next_k >= bwt->primary);
+			__builtin_prefetch(bwt_occ_intv(bwt, next_k), 0, 1);
+		}
+	}
+#endif
 	ok[3].x[is_back] = ik->x[is_back] + (ik->x[!is_back] <= bwt->primary && ik->x[!is_back] + ik->x[2] - 1 >= bwt->primary);
 	ok[2].x[is_back] = ok[3].x[is_back] + ok[3].x[2];
 	ok[1].x[is_back] = ok[2].x[is_back] + ok[2].x[2];
