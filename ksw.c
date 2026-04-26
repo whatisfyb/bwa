@@ -457,11 +457,16 @@ int ksw_extend2_neon(int qlen, const uint8_t *query, int tlen, const uint8_t *ta
 			h1 = h0 - (o_del + e_del * (i + 1));
 			if (h1 < 0) h1 = 0;
 		} else h1 = 0;
-		/* NEON inner loop: vectorize H/E/M computation, F via vgetq_lane_s32
-		 * E has no column dependency -> fully parallel
-		 * M = H_diag + q[j] (parallel if H_diag > 0)
-		 * F has column dependency -> extract lanes in order via vgetq_lane_s32
-		 *   (register-to-register, no store-load through memory) */
+		/* NEON inner loop: vectorize M/E computation, scalar F propagation
+		 *
+		 * Strategy: NEON computes 4 cells of M, H_noF, E_new, F_init in parallel,
+		 * stores to stack buffers. Then scalar loop reads the buffer sequentially
+		 * for F propagation and H write-back.
+		 *
+		 * This avoids 12x vgetq_lane_s32 per 4 cells, replacing with vst1q_s32
+		 * to stack + scalar loads. Stack buffer hits L1 cache (~4 cycles) vs
+		 * vgetq_lane_s32 with serial dependency chain (~3 cycles each). */
+		int32_t h_buf[4], f_buf[4];
 		j = beg;
 		for (; LIKELY(j + 3 < end); j += 4) {
 			int32x4_t vH_diag = vld1q_s32(&H[j]);
@@ -469,57 +474,41 @@ int ksw_extend2_neon(int qlen, const uint8_t *query, int tlen, const uint8_t *ta
 			int8x8_t  q8      = vld1_s8(&q[j]);
 			int16x8_t q16     = vmovl_s8(q8);
 			int32x4_t vq      = vmovl_s16(vget_low_s16(q16));
-			/* M = H_diag > 0 ? H_diag + q : 0 */
 			uint32x4_t v_nz   = vcgtq_s32(vH_diag, v_zero);
 			int32x4_t vM      = vbslq_s32(v_nz, vaddq_s32(vH_diag, vq), v_zero);
-			/* H = max(M, E, F) — F not yet merged, compute H_noF */
 			int32x4_t vH_noF  = vmaxq_s32(vM, vE_old);
-			/* E_new = max(M - oe_del, E_old - e_del, 0) */
 			int32x4_t vE_new  = vmaxq_s32(vsubq_s32(vE_old, v_e_del), vmaxq_s32(vsubq_s32(vM, v_oe_del), v_zero));
-			vst1q_s32(&E[j], vE_new);
-			/* F candidates from M: F_init = max(M - oe_ins, 0) */
 			int32x4_t vF_init = vmaxq_s32(vsubq_s32(vM, v_oe_ins), v_zero);
-			/* Merge F into H using vgetq_lane_s32 (register-to-register, no memory)
-			 * F has column dependency: F(j) = max(F(j-1)-e_ins, M(j)-oe_ins, 0)
-			 * We process lanes 0..3 in order, extracting from NEON registers directly */
-			int32_t h_lane, M_lane, f_cand;
-			M_lane = vgetq_lane_s32(vM, 0);
-			f_cand = vgetq_lane_s32(vF_init, 0);
-			f = f > f_cand? f : f_cand;
-			h_lane = vgetq_lane_s32(vH_noF, 0);
-			h_lane = h_lane > f? h_lane : f;
-			H[j]   = h1; h1 = h_lane;
+			vst1q_s32(&E[j], vE_new);
+			vst1q_s32(h_buf, vH_noF);
+			vst1q_s32(f_buf, vF_init);
+			/* Scalar F propagation from stack buffers */
+			int32_t t;
+			t = f_buf[0]; f = f > t? f : t;
+			t = h_buf[0]; t = t > f? t : f;
+			H[j]   = h1; h1 = t;
 			mj = m_score > h1? mj : j;   m_score = m_score > h1? m_score : h1;
 			f -= e_ins;
 
-			M_lane = vgetq_lane_s32(vM, 1);
-			f_cand = vgetq_lane_s32(vF_init, 1);
-			f = f > f_cand? f : f_cand;
-			h_lane = vgetq_lane_s32(vH_noF, 1);
-			h_lane = h_lane > f? h_lane : f;
-			H[j+1] = h1; h1 = h_lane;
+			t = f_buf[1]; f = f > t? f : t;
+			t = h_buf[1]; t = t > f? t : f;
+			H[j+1] = h1; h1 = t;
 			mj = m_score > h1? mj : j+1; m_score = m_score > h1? m_score : h1;
 			f -= e_ins;
 
-			M_lane = vgetq_lane_s32(vM, 2);
-			f_cand = vgetq_lane_s32(vF_init, 2);
-			f = f > f_cand? f : f_cand;
-			h_lane = vgetq_lane_s32(vH_noF, 2);
-			h_lane = h_lane > f? h_lane : f;
-			H[j+2] = h1; h1 = h_lane;
+			t = f_buf[2]; f = f > t? f : t;
+			t = h_buf[2]; t = t > f? t : f;
+			H[j+2] = h1; h1 = t;
 			mj = m_score > h1? mj : j+2; m_score = m_score > h1? m_score : h1;
 			f -= e_ins;
 
-			M_lane = vgetq_lane_s32(vM, 3);
-			f_cand = vgetq_lane_s32(vF_init, 3);
-			f = f > f_cand? f : f_cand;
-			h_lane = vgetq_lane_s32(vH_noF, 3);
-			h_lane = h_lane > f? h_lane : f;
-			H[j+3] = h1; h1 = h_lane;
+			t = f_buf[3]; f = f > t? f : t;
+			t = h_buf[3]; t = t > f? t : f;
+			H[j+3] = h1; h1 = t;
 			mj = m_score > h1? mj : j+3; m_score = m_score > h1? m_score : h1;
 			f -= e_ins;
 		}
-		/* Scalar tail for remaining <4 cells */
+			/* Scalar tail for remaining <4 cells */
 		for (; LIKELY(j < end); ++j) {
 			int32_t h, M = H[j], e = E[j];
 			H[j] = h1;
