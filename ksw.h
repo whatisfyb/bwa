@@ -82,6 +82,9 @@ extern "C" {
 	 */
 	int ksw_global(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int w, int *n_cigar, uint32_t **cigar);
 	int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);
+#ifdef OPT_KSW_GLOBAL2_NEON
+	int ksw_global2_neon(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_);
+#endif
 
 	/**
 	 * Extend alignment

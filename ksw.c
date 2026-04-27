@@ -35,6 +35,10 @@
 #endif
 #include "ksw.h"
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
 #endif
@@ -640,6 +644,117 @@ int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target,
 	free(eh); free(qp); free(z);
 	return score;
 }
+
+#ifdef OPT_KSW_GLOBAL2_NEON
+int ksw_global2_neon(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
+{
+	/* Fall back to scalar for CIGAR path */
+	if (n_cigar_ && cigar_)
+		return ksw_global2(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_);
+
+	int32_t *H, *E;
+	int8_t *qp;
+	int i, j, k, oe_del = o_del + e_del, oe_ins = o_ins + e_ins, score;
+	int32_t minus_inf = MINUS_INF;
+
+	if (n_cigar_) *n_cigar_ = 0;
+	qp = malloc(qlen * m);
+	H  = malloc((qlen + 1) * 4);
+	E  = malloc((qlen + 1) * 4);
+	/* generate query profile */
+	for (k = i = 0; k < m; ++k) {
+		const int8_t *p = &mat[k * m];
+		for (j = 0; j < qlen; ++j) qp[i++] = p[query[j]];
+	}
+	/* fill first row */
+	H[0] = 0;  E[0] = minus_inf;
+	for (j = 1; j <= qlen && j <= w; ++j) {
+		H[j] = -(o_ins + e_ins * j);
+		E[j] = minus_inf;
+	}
+	for (; j <= qlen; ++j) {
+		H[j] = minus_inf;
+		E[j] = minus_inf;
+	}
+
+	/* NEON constants */
+	int32x4_t v_e_del    = vdupq_n_s32(e_del);
+	int32x4_t v_oe_del   = vdupq_n_s32(oe_del);
+	int32x4_t v_oe_ins   = vdupq_n_s32(oe_ins);
+
+	/* DP loop */
+	for (i = 0; LIKELY(i < tlen); ++i) {
+		int32_t f = minus_inf, h1, beg, end, t;
+		int8_t *q = &qp[target[i] * qlen];
+		beg = i > w? i - w : 0;
+		end = i + w + 1 < qlen? i + w + 1 : qlen;
+		h1 = beg == 0? -(o_del + e_del * (i + 1)) : minus_inf;
+
+		/* NEON inner loop: 4 cells at a time */
+		j = beg;
+		for (; LIKELY(j + 3 < end); j += 4) {
+			int32x4_t vH_diag = vld1q_s32(&H[j]);
+			int32x4_t vE_old  = vld1q_s32(&E[j]);
+			int8x8_t  q8      = vld1_s8(&q[j]);
+			int16x8_t q16     = vmovl_s8(q8);
+			int32x4_t vq      = vmovl_s16(vget_low_s16(q16));
+			/* M = H_diag + q (global allows negative scores) */
+			int32x4_t vM      = vaddq_s32(vH_diag, vq);
+			/* H_noF = max(M, E) */
+			int32x4_t vH_noF  = vmaxq_s32(vM, vE_old);
+			/* E_new = max(E_old - e_del, M - oe_del) */
+			int32x4_t vE_new  = vmaxq_s32(vsubq_s32(vE_old, v_e_del), vsubq_s32(vM, v_oe_del));
+			/* F_init = M - oe_ins (candidate for F) */
+			int32x4_t vF_init = vsubq_s32(vM, v_oe_ins);
+			vst1q_s32(&E[j], vE_new);
+			/* Stack buffer for scalar F propagation */
+			int32_t h_buf[4], f_buf[4];
+			vst1q_s32(h_buf, vH_noF);
+			vst1q_s32(f_buf, vF_init);
+			/* Scalar F propagation per lane */
+			t = f_buf[0]; f = f > t? f : t;
+			t = h_buf[0]; t = t > f? t : f;
+			H[j]   = h1; h1 = t;
+			f -= e_ins;
+
+			t = f_buf[1]; f = f > t? f : t;
+			t = h_buf[1]; t = t > f? t : f;
+			H[j+1] = h1; h1 = t;
+			f -= e_ins;
+
+			t = f_buf[2]; f = f > t? f : t;
+			t = h_buf[2]; t = t > f? t : f;
+			H[j+2] = h1; h1 = t;
+			f -= e_ins;
+
+			t = f_buf[3]; f = f > t? f : t;
+			t = h_buf[3]; t = t > f? t : f;
+			H[j+3] = h1; h1 = t;
+			f -= e_ins;
+		}
+		/* Scalar tail for remaining <4 cells */
+		for (; LIKELY(j < end); ++j) {
+			int32_t h, M = H[j], e = E[j];
+			H[j] = h1;
+			M += q[j];
+			h = M >= e? M : e;
+			h = h >= f?  h : f;
+			h1 = h;
+			t = M - oe_del;
+			e -= e_del;
+			e  = e > t? e : t;
+			E[j] = e;
+			t = M - oe_ins;
+			f -= e_ins;
+			f  = f > t? f : t;
+		}
+		H[end] = h1; E[end] = minus_inf;
+	}
+	score = H[qlen];
+	free(H); free(E); free(qp);
+	return score;
+}
+#endif /* OPT_KSW_GLOBAL2_NEON */
 
 int ksw_global(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int w, int *n_cigar_, uint32_t **cigar_)
 {
