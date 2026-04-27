@@ -698,39 +698,28 @@ int ksw_global2_neon(int qlen, const uint8_t *query, int tlen, const uint8_t *ta
 			int8x8_t  q8      = vld1_s8(&q[j]);
 			int16x8_t q16     = vmovl_s8(q8);
 			int32x4_t vq      = vmovl_s16(vget_low_s16(q16));
-			/* M = H_diag + q (global allows negative scores) */
 			int32x4_t vM      = vaddq_s32(vH_diag, vq);
-			/* H_noF = max(M, E) */
 			int32x4_t vH_noF  = vmaxq_s32(vM, vE_old);
-			/* E_new = max(E_old - e_del, M - oe_del) */
 			int32x4_t vE_new  = vmaxq_s32(vsubq_s32(vE_old, v_e_del), vsubq_s32(vM, v_oe_del));
-			/* F_init = M - oe_ins (candidate for F) */
 			int32x4_t vF_init = vsubq_s32(vM, v_oe_ins);
 			vst1q_s32(&E[j], vE_new);
-			/* Stack buffer for scalar F propagation */
 			int32_t h_buf[4], f_buf[4];
 			vst1q_s32(h_buf, vH_noF);
 			vst1q_s32(f_buf, vF_init);
-			/* Scalar F propagation per lane */
-			t = f_buf[0]; f = f > t? f : t;
-			t = h_buf[0]; t = t > f? t : f;
-			H[j]   = h1; h1 = t;
-			f -= e_ins;
+			/* Scalar F propagation per lane:
+			 * Order must match scalar: merge H with old f FIRST, then update f.
+			 * Scalar does: h=max(h,f), then f-=e, f=max(f,M-oe) */
+			t = h_buf[0]; t = t > f? t : f; H[j]   = h1; h1 = t;
+			f -= e_ins; t = f_buf[0]; f = f > t? f : t;
 
-			t = f_buf[1]; f = f > t? f : t;
-			t = h_buf[1]; t = t > f? t : f;
-			H[j+1] = h1; h1 = t;
-			f -= e_ins;
+			t = h_buf[1]; t = t > f? t : f; H[j+1] = h1; h1 = t;
+			f -= e_ins; t = f_buf[1]; f = f > t? f : t;
 
-			t = f_buf[2]; f = f > t? f : t;
-			t = h_buf[2]; t = t > f? t : f;
-			H[j+2] = h1; h1 = t;
-			f -= e_ins;
+			t = h_buf[2]; t = t > f? t : f; H[j+2] = h1; h1 = t;
+			f -= e_ins; t = f_buf[2]; f = f > t? f : t;
 
-			t = f_buf[3]; f = f > t? f : t;
-			t = h_buf[3]; t = t > f? t : f;
-			H[j+3] = h1; h1 = t;
-			f -= e_ins;
+			t = h_buf[3]; t = t > f? t : f; H[j+3] = h1; h1 = t;
+			f -= e_ins; t = f_buf[3]; f = f > t? f : t;
 		}
 		/* Scalar tail for remaining <4 cells */
 		for (; LIKELY(j < end); ++j) {
