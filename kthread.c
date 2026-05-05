@@ -3,6 +3,43 @@
 #include <stdlib.h>
 #include <limits.h>
 
+/**************
+ * NUMA bind  *
+ **************/
+
+#if defined(OPT_NUMA_BIND) && defined(__linux__)
+#include <numa.h>
+#include <numaif.h>
+#endif
+
+/* Global BWT pointer set by bwamem.c before spawning worker threads.
+ * Used to determine which NUMA node the BWT index resides on. */
+const void *opt_numa_bwt_ptr = 0;
+
+#if defined(OPT_NUMA_BIND) && defined(__linux__)
+/* Return the NUMA node where the given address resides, or -1 on error.
+ * Uses get_mempolicy() with MPOL_F_ADDR as numa_addr_to_node() is not
+ * available in all libnuma versions. */
+static int opt_numa_addr_to_node(const void *addr)
+{
+	int node = -1;
+	long ret = get_mempolicy(&node, NULL, 0, (void*)addr, MPOL_F_ADDR);
+	return ret == 0 ? node : -1;
+}
+#endif
+
+static void opt_numa_bind_thread(void)
+{
+#if defined(OPT_NUMA_BIND) && defined(__linux__)
+	if (opt_numa_bwt_ptr) {
+		int node = opt_numa_addr_to_node(opt_numa_bwt_ptr);
+		if (node >= 0) {
+			numa_run_on_node(node);
+		}
+	}
+#endif
+}
+
 /************
  * kt_for() *
  ************/
@@ -36,6 +73,7 @@ static void *ktf_worker(void *data)
 {
 	ktf_worker_t *w = (ktf_worker_t*)data;
 	long i;
+	opt_numa_bind_thread();
 	for (;;) {
 		i = __sync_fetch_and_add(&w->i, w->t->n_threads);
 		if (i >= w->t->n) break;
@@ -87,6 +125,7 @@ static void *ktp_worker(void *data)
 {
 	ktp_worker_t *w = (ktp_worker_t*)data;
 	ktp_t *p = w->pl;
+	opt_numa_bind_thread();
 	while (w->step < p->n_steps) {
 		// test whether we can kick off the job with this worker
 		pthread_mutex_lock(&p->mutex);

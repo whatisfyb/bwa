@@ -70,6 +70,7 @@
  */
 
 static const bntseq_t *global_bns = 0; // for debugging only
+extern const void *opt_numa_bwt_ptr; // set in mem_process_seqs for NUMA binding
 
 mem_opt_t *mem_opt_init()
 {
@@ -1242,6 +1243,7 @@ void mem_process_seqs(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 
 	ctime = cputime(); rtime = realtime();
 	global_bns = bns;
+	opt_numa_bwt_ptr = bwt;
 	w.regs = malloc(n * sizeof(mem_alnreg_v));
 	w.opt = opt; w.bwt = bwt; w.bns = bns; w.pac = pac;
 	w.seqs = seqs; w.n_processed = n_processed;

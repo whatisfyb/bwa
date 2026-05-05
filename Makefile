@@ -15,11 +15,20 @@ INCLUDES=
 LIBS=		-lm -lz -lpthread
 SUBDIRS=	.
 
+# opt-numa (NUMA-aware thread binding for dual-socket servers)
+# Recommended: make OPT_NUMA_BIND=1
+# Manual:     make CFLAGS="-g -Wall -Wno-unused-function -O3 -DOPT_NUMA_BIND" LIBS="-lm -lz -lpthread -lnuma -lrt"
+
 ifeq ($(shell uname -s),Linux)
 	LIBS += -lrt
 endif
 ifeq ($(shell uname -s),GNU/kFreeBSD)
 	LIBS += -lrt
+endif
+
+ifdef OPT_NUMA_BIND
+CFLAGS += -DOPT_NUMA_BIND
+LIBS += -lnuma
 endif
 
 ifneq ($(asan),)
