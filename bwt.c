@@ -112,6 +112,73 @@ bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 	return sa + bwt->sa[k/bwt->sa_intv];
 }
 
+#ifdef OPT_BWT_SA_BATCH
+/* Batch-interleaved bwt_sa: compute N SA values simultaneously by
+ * interleaving their invPsi chains, allowing the DRAM controller to
+ * pipeline multiple outstanding requests and overlap latencies.
+ *
+ * The key insight: multiple bwt_sa calls are independent (their
+ * invPsi chains don't share data). By executing N chains' invPsi
+ * steps within the same iteration, we issue N DRAM requests in
+ * rapid succession. The DRAM controller can pipeline these requests,
+ * reducing effective per-request latency from ~100ns to ~10-20ns
+ * per pipelined request.
+ *
+ * We deliberately do NOT add per-chain OCC prefetch or SA table
+ * prefetch inside the iteration loop — experiments on x86 chr1
+ * showed that these extra prefetch instructions add overhead that
+ * exceeds their cache benefit (see v2/v3 negative results).
+ * The batch interleaving itself provides sufficient DRAM overlap.
+ *
+ * A single Phase 0 prefetch before the loop gives the maximum
+ * possible head start for the first iteration's OCC accesses. */
+void bwt_sa_batch(const bwt_t *bwt, int n, const bwtint_t *keys, bwtint_t *results)
+{
+	bwtint_t sa[BWT_SA_BATCH_MAX], mask = bwt->sa_intv - 1;
+	bwtint_t k[BWT_SA_BATCH_MAX]; /* current positions for each chain */
+	int active; /* number of chains still iterating */
+
+	/* sanity: n should not exceed compile-time max */
+	if (n > BWT_SA_BATCH_MAX) n = BWT_SA_BATCH_MAX;
+
+	/* initialize: copy starting keys, zero sa counters */
+	for (int i = 0; i < n; ++i) {
+		k[i] = keys[i];
+		sa[i] = 0;
+	}
+
+	/* Phase 0: prefetch OCC blocks for the first invPsi step of each chain.
+	 * This is the ONLY prefetch we do — it gives the memory subsystem the
+	 * maximum head start before the main loop, with minimal instruction overhead. */
+	for (int i = 0; i < n; ++i) {
+		if (k[i] & mask) {
+			bwtint_t pk = k[i] - (k[i] > bwt->primary);
+			__builtin_prefetch(bwt_occ_intv(bwt, pk), 0, 1);
+		}
+	}
+
+	/* interleaved invPsi iteration: execute N chains' steps per round.
+	 * No per-step prefetch — the DRAM controller pipelines the N
+	 * concurrent bwt_occ requests from the invPsi calls themselves. */
+	active = n;
+	while (active > 0) {
+		active = 0;
+		for (int i = 0; i < n; ++i) {
+			if (k[i] & mask) {
+				sa[i]++;
+				k[i] = bwt_invPsi(bwt, k[i]);
+				if (k[i] & mask) active++;
+			}
+		}
+	}
+
+	/* collect results: read sampled SA at the final position */
+	for (int i = 0; i < n; ++i) {
+		results[i] = sa[i] + bwt->sa[k[i] / bwt->sa_intv];
+	}
+}
+#endif /* OPT_BWT_SA_BATCH */
+
 static inline int __occ_aux(uint64_t y, int c)
 {
 	// reduce nucleotide counting to bits counting

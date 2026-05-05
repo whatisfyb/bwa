@@ -108,6 +108,12 @@ extern "C" {
 	void bwt_2occ(const bwt_t *bwt, bwtint_t k, bwtint_t l, ubyte_t c, bwtint_t *ok, bwtint_t *ol);
 	void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4]);
 
+	#define BWT_SA_BATCH_MAX 4
+
+#ifdef OPT_BWT_SA_BATCH
+	void bwt_sa_batch(const bwt_t *bwt, int n, const bwtint_t *keys, bwtint_t *results);
+#endif
+
 	int bwt_match_exact(const bwt_t *bwt, int len, const ubyte_t *str, bwtint_t *sa_begin, bwtint_t *sa_end);
 	int bwt_match_exact_alt(const bwt_t *bwt, int len, const ubyte_t *str, bwtint_t *k0, bwtint_t *l0);
 

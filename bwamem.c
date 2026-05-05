@@ -302,6 +302,52 @@ mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 		int64_t k;
 		// if (slen < opt->min_seed_len) continue; // ignore if too short or too repetitive
 		step = p->x[2] > opt->max_occ? p->x[2] / opt->max_occ : 1;
+#ifdef OPT_BWT_SA_BATCH
+		/* Batch-interleaved bwt_sa: compute BWT_SA_BATCH_MAX SA values
+		 * at a time, interleaving their invPsi chains to overlap DRAM
+		 * latencies. The DRAM controller can pipeline N concurrent
+		 * read requests, reducing total wait from N*100ns to ~100ns+N*10ns.
+		 * Results are identical to serial bwt_sa calls — same algorithm,
+		 * just different scheduling of memory requests. */
+		for (k = count = 0; k < p->x[2] && count < opt->max_occ; ) {
+			int batch = 0;
+			bwtint_t keys[BWT_SA_BATCH_MAX], results[BWT_SA_BATCH_MAX];
+			int64_t offsets[BWT_SA_BATCH_MAX]; /* k values for each element */
+			/* gather up to BWT_SA_BATCH_MAX positions for batch processing */
+			for (int b = 0; b < BWT_SA_BATCH_MAX && k < p->x[2] && count + b < opt->max_occ; ++b, k += step) {
+				keys[b] = p->x[0] + k;
+				offsets[b] = k;
+				batch++;
+				count++;
+			}
+			if (batch == 0) break;
+			/* compute all SA values in one interleaved pass */
+			bwt_sa_batch(bwt, batch, keys, results);
+			/* use the results — same logic as original serial version */
+			for (int b = 0; b < batch; ++b) {
+				mem_chain_t tmp, *lower, *upper;
+				mem_seed_t s;
+				int rid, to_add = 0;
+				s.rbeg = tmp.pos = results[b];
+				s.qbeg = p->info>>32;
+				s.score= s.len = slen;
+				rid = bns_intv2rid(bns, s.rbeg, s.rbeg + s.len);
+				if (rid < 0) continue; // bridging multiple reference sequences or the forward-reverse boundary; TODO: split the seed; don't discard it!!!
+				if (kb_size(tree)) {
+					kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
+					if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid)) to_add = 1;
+				} else to_add = 1;
+				if (to_add) { // add the seed as a new chain
+					tmp.n = 1; tmp.m = 4;
+					tmp.seeds = calloc(tmp.m, sizeof(mem_seed_t));
+					tmp.seeds[0] = s;
+					tmp.rid = rid;
+					tmp.is_alt = !!bns->anns[rid].is_alt;
+					kb_putp(chn, tree, &tmp);
+				}
+			}
+		}
+#else
 		for (k = count = 0; k < p->x[2] && count < opt->max_occ; k += step, ++count) {
 			mem_chain_t tmp, *lower, *upper;
 			mem_seed_t s;
@@ -324,6 +370,7 @@ mem_chain_v mem_chain(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *bn
 				kb_putp(chn, tree, &tmp);
 			}
 		}
+#endif
 	}
 	if (buf == 0) smem_aux_destroy(aux);
 
