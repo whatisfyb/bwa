@@ -22,6 +22,14 @@ ifeq ($(shell uname -s),GNU/kFreeBSD)
 	LIBS += -lrt
 endif
 
+# S-4: huge page allocation for BWT/SA index (2MB huge pages via mmap MAP_HUGETLB)
+# Reduces TLB misses for large indexes (GRCh38 BWT ~2.9GB = ~1500 4KB pages -> ~738 2MB pages)
+# Falls back to calloc if huge pages unavailable
+# Recommended: make USE_HUGETLB=1
+ifdef USE_HUGETLB
+CFLAGS += -DOPT_HUGETLB
+endif
+
 ifneq ($(asan),)
 	CFLAGS+=-fsanitize=address
 	LIBS+=-fsanitize=address -ldl

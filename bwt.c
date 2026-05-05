@@ -35,6 +35,48 @@
 #include "bwt.h"
 #include "kvec.h"
 
+#ifdef OPT_HUGETLB
+#include <sys/mman.h>
+#include <errno.h>
+
+/* Allocate memory with 2MB huge pages via mmap MAP_HUGETLB.
+ * Falls back to calloc if huge pages are unavailable (e.g., not enough
+ * contiguous 2MB pages, or kernel not configured for huge pages).
+ * Returns NULL on failure (same as calloc). */
+static void *hugetlb_calloc(size_t nmemb, size_t size)
+{
+	size_t total = nmemb * size;
+	/* Round up to 2MB boundary for mmap alignment */
+	size_t huge_page_size = 2UL * 1024 * 1024;
+	size_t aligned_size = (total + huge_page_size - 1) & ~(huge_page_size - 1);
+
+	void *ptr = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE,
+	                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	if (ptr == MAP_FAILED) {
+		/* Huge pages unavailable, fall back to calloc */
+		return calloc(nmemb, size);
+	}
+	return ptr;
+}
+
+static void hugetlb_free(void *ptr, size_t nmemb, size_t size)
+{
+	if (!ptr) return;
+	size_t total = nmemb * size;
+	size_t huge_page_size = 2UL * 1024 * 1024;
+	size_t aligned_size = (total + huge_page_size - 1) & ~(huge_page_size - 1);
+
+	/* Check if this was a mmap allocation or a calloc fallback.
+	 * mmap'd memory from hugetlb_calloc is page-aligned at huge page boundary.
+	 * We use a heuristic: if the address is huge-page aligned, try munmap.
+	 * If munmap fails (not a mmap region), fall back to free(). */
+	if (((uintptr_t)ptr & (huge_page_size - 1)) == 0) {
+		if (munmap(ptr, aligned_size) == 0) return;
+	}
+	free(ptr);
+}
+#endif
+
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
 #endif
@@ -433,7 +475,11 @@ void bwt_restore_sa(const char *fn, bwt_t *bwt)
 	xassert(primary == bwt->seq_len, "SA-BWT inconsistency: seq_len is not the same.");
 
 	bwt->n_sa = (bwt->seq_len + bwt->sa_intv) / bwt->sa_intv;
+#ifdef OPT_HUGETLB
+	bwt->sa = (bwtint_t*)hugetlb_calloc(bwt->n_sa, sizeof(bwtint_t));
+#else
 	bwt->sa = (bwtint_t*)calloc(bwt->n_sa, sizeof(bwtint_t));
+#endif
 	bwt->sa[0] = -1;
 
 	fread_fix(fp, sizeof(bwtint_t) * (bwt->n_sa - 1), bwt->sa + 1);
@@ -449,7 +495,11 @@ bwt_t *bwt_restore_bwt(const char *fn)
 	fp = xopen(fn, "rb");
 	err_fseek(fp, 0, SEEK_END);
 	bwt->bwt_size = (err_ftell(fp) - sizeof(bwtint_t) * 5) >> 2;
+#ifdef OPT_HUGETLB
+	bwt->bwt = (uint32_t*)hugetlb_calloc(bwt->bwt_size, 4);
+#else
 	bwt->bwt = (uint32_t*)calloc(bwt->bwt_size, 4);
+#endif
 	err_fseek(fp, 0, SEEK_SET);
 	err_fread_noeof(&bwt->primary, sizeof(bwtint_t), 1, fp);
 	err_fread_noeof(bwt->L2+1, sizeof(bwtint_t), 4, fp);
@@ -464,6 +514,11 @@ bwt_t *bwt_restore_bwt(const char *fn)
 void bwt_destroy(bwt_t *bwt)
 {
 	if (bwt == 0) return;
+#ifdef OPT_HUGETLB
+	hugetlb_free(bwt->sa, bwt->n_sa, sizeof(bwtint_t));
+	hugetlb_free(bwt->bwt, bwt->bwt_size, 4);
+#else
 	free(bwt->sa); free(bwt->bwt);
+#endif
 	free(bwt);
 }
