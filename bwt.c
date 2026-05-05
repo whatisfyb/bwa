@@ -95,6 +95,70 @@ bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 	return sa + bwt->sa[k/bwt->sa_intv];
 }
 
+#ifdef OPT_BWT_SA_BATCH
+/* Batch-interleaved bwt_sa: compute N SA values simultaneously by
+ * interleaving their invPsi chains, allowing the DRAM controller to
+ * pipeline multiple outstanding requests and overlap latencies.
+ *
+ * Each invPsi step involves 1 random DRAM access (~80-100ns). A single
+ * bwt_sa call takes ~16 invPsi steps = ~1.6us. When computing N bwt_sa
+ * values serially, total time = N * 1.6us. By interleaving, N requests
+ * are issued in rapid succession; the DRAM controller can pipeline them,
+ * reducing total time to approximately max(single_chain_time).
+ *
+ * Two-phase per iteration: (1) prefetch all next OCC blocks, (2) execute
+ * all invPsi steps. The prefetch gives the memory subsystem a head start
+ * while we compute addresses for the next batch. */
+void bwt_sa_batch(const bwt_t *bwt, int n, const bwtint_t *keys, bwtint_t *results)
+{
+	bwtint_t sa[BWT_SA_BATCH_MAX], mask = bwt->sa_intv - 1;
+	bwtint_t k[BWT_SA_BATCH_MAX]; /* current positions for each chain */
+	int active; /* number of chains still iterating */
+
+	/* sanity: n should not exceed compile-time max */
+	if (n > BWT_SA_BATCH_MAX) n = BWT_SA_BATCH_MAX;
+
+	/* initialize: copy starting keys, zero sa counters */
+	for (int i = 0; i < n; ++i) {
+		k[i] = keys[i];
+		sa[i] = 0;
+	}
+
+	/* interleaved invPsi iteration */
+	active = n;
+	while (active > 0) {
+		/* Phase 1: prefetch OCC blocks for all active chains.
+		 * bwt_occ_intv computes the OCC block address from k;
+		 * we adjust for the primary position as invPsi does. */
+		for (int i = 0; i < n; ++i) {
+			if (k[i] & mask) {
+				bwtint_t pk = k[i] - (k[i] > bwt->primary);
+				__builtin_prefetch(bwt_occ_intv(bwt, pk), 0, 1);
+			}
+		}
+
+		/* Phase 2: execute invPsi for all active chains.
+		 * The prefetches from Phase 1 are now in flight to DRAM,
+		 * overlapping with the computation of this phase's invPsi steps.
+		 * For chains where prefetch succeeded, bwt_occ will hit
+		 * in cache instead of waiting ~100ns for DRAM. */
+		active = 0;
+		for (int i = 0; i < n; ++i) {
+			if (k[i] & mask) {
+				sa[i]++;
+				k[i] = bwt_invPsi(bwt, k[i]);
+				if (k[i] & mask) active++; /* still not at sampled SA position */
+			}
+		}
+	}
+
+	/* collect results: read sampled SA at the final position */
+	for (int i = 0; i < n; ++i) {
+		results[i] = sa[i] + bwt->sa[k[i] / bwt->sa_intv];
+	}
+}
+#endif /* OPT_BWT_SA_BATCH */
+
 static inline int __occ_aux(uint64_t y, int c)
 {
 	// reduce nucleotide counting to bits counting
