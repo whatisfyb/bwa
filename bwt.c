@@ -325,6 +325,27 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 
 	for (i = x - 1; i >= -1; --i) { // backward search for MEMs
 		c = i < 0? -1 : q[i] < 4? q[i] : -1; // c==-1 if i<0 or q[i] is an ambiguous base
+#ifdef OPT_BWT_EXTEND_PREFETCH
+		/* Prefetch OCC blocks for all candidates before the inner loop.
+		 * Each bwt_extend call triggers bwt_2occ4, which accesses a random
+		 * OCC block in the BWT array (~100ns DRAM latency). By prefetching
+		 * all candidates' OCC blocks before the loop starts, we give the
+		 * memory subsystem a head start. When the loop then executes
+		 * bwt_extend sequentially, some OCC blocks may already be in cache.
+		 * The bwt_2occ4 call takes k = ik->x[!is_back]-1 and
+		 * l = ik->x[!is_back]-1+ik->x[2]; both k and l may be in
+		 * different OCC intervals, so we prefetch both. */
+		if (c >= 0 && ik.x[2] >= max_intv) {
+			for (j = 0; j < prev->n; ++j) {
+				bwtintv_t *p = &prev->a[j];
+				bwtint_t pk = p->x[1] - 1 - (p->x[1] - 1 >= bwt->primary);
+				bwtint_t pl = p->x[1] - 1 + p->x[2] - (p->x[1] - 1 + p->x[2] >= bwt->primary);
+				__builtin_prefetch(bwt_occ_intv(bwt, pk), 0, 1);
+				if (pl >> OCC_INTV_SHIFT != pk >> OCC_INTV_SHIFT)
+					__builtin_prefetch(bwt_occ_intv(bwt, pl), 0, 1);
+			}
+		}
+#endif
 		for (j = 0, curr->n = 0; j < prev->n; ++j) {
 			bwtintv_t *p = &prev->a[j];
 			if (c >= 0 && ik.x[2] >= max_intv) bwt_extend(bwt, p, ok, 1);
