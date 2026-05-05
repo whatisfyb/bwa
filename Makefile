@@ -22,6 +22,23 @@ ifeq ($(shell uname -s),GNU/kFreeBSD)
 	LIBS += -lrt
 endif
 
+# S-7: jemalloc for reduced malloc lock contention in multi-threaded mode
+# Recommended: make USE_JEMALLOC=1
+# Manual:     make CFLAGS="..." LIBS="-lm -lz -lpthread -ljemalloc -lrt"
+ifdef USE_JEMALLOC
+LIBS += -ljemalloc
+endif
+
+# S-8: aggressive compilation tuning
+# Recommended: make USE_FAST_FLAGS=1
+# This adds -Ofast -march=native -fno-math-errno -fno-trapping-math
+# -Ofast includes -O3 + -ffast-math (implies -fno-math-errno etc.)
+# -march=native enables CPU-specific instructions (AVX2/SSE on x86, NEON on ARM)
+# WARNING: -Ofast enables -ffast-math which may affect floating-point behavior
+ifdef USE_FAST_FLAGS
+CFLAGS = -Wall -Wno-unused-function -Ofast -march=native -fno-math-errno -fno-trapping-math
+endif
+
 ifneq ($(asan),)
 	CFLAGS+=-fsanitize=address
 	LIBS+=-fsanitize=address -ldl
