@@ -205,6 +205,12 @@ void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtin
 		// prepare cntk[]
 		endk = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4));
 		endl = p + ((l>>4) - ((l&~OCC_INTV_MASK)>>4));
+#ifdef OPT_PREFETCH
+		/* Prefetch BWT occ interval data for the next position.
+		 * BWT array is ~3GB for GRCh38, accessed sequentially within intervals.
+		 * PLDL3KEEP (locality=1): data will be reused across multiple bwt_extend calls. */
+		if (p + 8 <= endl) __builtin_prefetch(p + 8, 0, 1);
+#endif
 		for (x = 0; p < endk; ++p) x += __occ_aux4(bwt, *p);
 		y = x;
 		tmp = *p & ~((1U<<((~k&15)<<1)) - 1);
@@ -307,6 +313,17 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 			break;
 		} else if (q[i] < 4) { // an A/C/G/T base
 			c = 3 - q[i]; // complement of q[i]
+#ifdef OPT_PREFETCH
+			/* Prefetch BWT data for the next base position.
+			 * bwt_extend -> bwt_2occ4 does random access into the ~3GB BWT array.
+			 * PLDL3KEEP: warm L3 cache for the next bwt_extend call. */
+			if (i + 1 < len && q[i+1] < 4) {
+				bwtint_t prefetch_k = ik.x[0] - 1;
+				bwtint_t prefetch_l = ik.x[0] - 1 + ik.x[2];
+				if (prefetch_k >= bwt->primary) { --prefetch_k; --prefetch_l; }
+				__builtin_prefetch(bwt_occ_intv(bwt, prefetch_k), 0, 1);
+			}
+#endif
 			bwt_extend(bwt, &ik, ok, 0);
 			if (ok[c].x[2] != ik.x[2]) { // change of the interval size
 				kv_push(bwtintv_t, *curr, ik);
@@ -325,6 +342,13 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 
 	for (i = x - 1; i >= -1; --i) { // backward search for MEMs
 		c = i < 0? -1 : q[i] < 4? q[i] : -1; // c==-1 if i<0 or q[i] is an ambiguous base
+#ifdef OPT_PREFETCH
+		/* Prefetch BWT occ data for the next backward position.
+		 * The backward loop calls bwt_extend for each interval in prev. */
+		if (c >= 0 && i > 0 && q[i-1] < 4 && prev->n > 0) {
+			__builtin_prefetch(bwt_occ_intv(bwt, prev->a[0].x[1] - 1), 0, 1);
+		}
+#endif
 		for (j = 0, curr->n = 0; j < prev->n; ++j) {
 			bwtintv_t *p = &prev->a[j];
 			if (c >= 0 && ik.x[2] >= max_intv) bwt_extend(bwt, p, ok, 1);

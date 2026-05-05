@@ -172,6 +172,16 @@ kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target, int _o_del, int _e_del
 		h = _mm_load_si128(H0 + slen - 1); // h={2,5,8,11,14,17,-1,-1} in the above example
 		h = _mm_slli_si128(h, 1); // h=H(i-1,-1); << instead of >> because x64 is little-endian
 		for (j = 0; LIKELY(j < slen); ++j) {
+#ifdef OPT_PREFETCH
+			/* Prefetch score vectors and DP rows 4 iterations ahead.
+			 * Each __m128i is 16 bytes; 4 steps = 64 bytes = 1 cache line.
+			 * PLDL1STRM (locality=0): streaming hint — data used once per DP row. */
+			if (j + 4 < slen) {
+				__builtin_prefetch(S + j + 4, 0, 0);
+				__builtin_prefetch(H0 + j + 4, 0, 0);
+				__builtin_prefetch(E + j + 4, 0, 0);
+			}
+#endif
 			/* SW cells are computed in the following order:
 			 *   H(i,j)   = max{H(i-1,j-1)+S(i,j), E(i,j), F(i,j)}
 			 *   E(i+1,j) = max{H(i,j)-q, E(i,j)-r}
@@ -303,6 +313,13 @@ kswr_t ksw_i16(kswq_t *q, int tlen, const uint8_t *target, int _o_del, int _e_de
 		h = _mm_load_si128(H0 + slen - 1); // h={2,5,8,11,14,17,-1,-1} in the above example
 		h = _mm_slli_si128(h, 2);
 		for (j = 0; LIKELY(j < slen); ++j) {
+#ifdef OPT_PREFETCH
+			if (j + 4 < slen) {
+				__builtin_prefetch(S + j + 4, 0, 0);
+				__builtin_prefetch(H0 + j + 4, 0, 0);
+				__builtin_prefetch(E + j + 4, 0, 0);
+			}
+#endif
 			h = _mm_adds_epi16(h, _mm_load_si128(S++));
 			e = _mm_load_si128(E + j);
 			h = _mm_max_epi16(h, e);

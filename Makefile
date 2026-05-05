@@ -22,6 +22,15 @@ ifeq ($(shell uname -s),GNU/kFreeBSD)
 	LIBS += -lrt
 endif
 
+# C-3: software prefetch hints for SW DP loops and BWT occurrence counting
+# Inserts __builtin_prefetch hints to reduce cache miss stalls
+# On x86: generates PREFETCHT0/PREFETCHT1 instructions
+# On ARM Kunpeng 920: generates PRFM PLDL1STRM/PLDL3KEEP instructions
+# Recommended: make USE_PREFETCH=1
+ifdef USE_PREFETCH
+CFLAGS += -DOPT_PREFETCH
+endif
+
 ifneq ($(asan),)
 	CFLAGS+=-fsanitize=address
 	LIBS+=-fsanitize=address -ldl
