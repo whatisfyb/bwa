@@ -325,6 +325,156 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 
 	for (i = x - 1; i >= -1; --i) { // backward search for MEMs
 		c = i < 0? -1 : q[i] < 4? q[i] : -1; // c==-1 if i<0 or q[i] is an ambiguous base
+#ifdef OPT_BWT_EXTEND_INTERLEAVE
+		/* M-12: Interleaved bwt_extend for multiple candidates in backward search.
+		 *
+		 * Original: each candidate calls bwt_extend → bwt_2occ4 sequentially,
+		 * each DRAM request ~80ns, no overlap.
+		 *
+		 * M-12: split bwt_2occ4 into Phase 0 (OCC header memcpy, DRAM) and
+		 * Phase 1 (loop computation, cached). In Phase 0, we load all N
+		 * candidates' OCC headers in a tight loop — the DRAM controller
+		 * pipelines these N concurrent requests. Each memcpy ~20-30ns, so
+		 * candidate #0's data arrives during candidates #3-#4's memcpy,
+		 * providing a ~80ns window matching DRAM latency.
+		 *
+		 * Only applies when c >= 0 and ik.x[2] >= max_intv (i.e. bwt_extend
+		 * will actually be called). Otherwise, fall through to original logic. */
+		if (c >= 0 && ik.x[2] >= max_intv) {
+			int nj = prev->n < BWT_EXTEND_ILV_MAX ? prev->n : BWT_EXTEND_ILV_MAX;
+			/* Phase 0: compute k/l for all candidates, load OCC headers.
+			 * We store each candidate's OCC interval pointer and header
+			 * locally. The tight memcpy loop forces the DRAM controller to
+			 * pipeline N concurrent cache-line requests. */
+			bwtint_t ilv_k[BWT_EXTEND_ILV_MAX], ilv_l[BWT_EXTEND_ILV_MAX];
+			bwtint_t ilv_cntk[BWT_EXTEND_ILV_MAX][4]; /* OCC headers for k */
+			uint32_t *ilv_p[BWT_EXTEND_ILV_MAX];
+			int ilv_same[BWT_EXTEND_ILV_MAX]; /* k/l same OCC interval? */
+			bwtint_t ilv_k0[BWT_EXTEND_ILV_MAX]; /* original k before adjust */
+			bwtint_t ilv_l0[BWT_EXTEND_ILV_MAX]; /* original l before adjust */
+			bwtintv_t ilv_ok[BWT_EXTEND_ILV_MAX][4]; /* extend results */
+			bwtint_t ilv_tk[BWT_EXTEND_ILV_MAX][4], ilv_tl[BWT_EXTEND_ILV_MAX][4];
+
+			/* Compute adjusted k/l for all candidates */
+			for (j = 0; j < nj; ++j) {
+				bwtintv_t *p = &prev->a[j];
+				ilv_k0[j] = p->x[0] - 1; /* bwt_extend uses x[!is_back]=x[0] for is_back=1 */
+				ilv_l0[j] = ilv_k0[j] + p->x[2];
+				ilv_k[j] = ilv_k0[j] - (ilv_k0[j] >= bwt->primary);
+				ilv_l[j] = ilv_l0[j] - (ilv_l0[j] >= bwt->primary);
+				ilv_same[j] = (ilv_l[j] >> OCC_INTV_SHIFT == ilv_k[j] >> OCC_INTV_SHIFT
+				               && ilv_k0[j] != (bwtint_t)(-1) && ilv_l0[j] != (bwtint_t)(-1));
+			}
+			/* Phase 0a: tight loop — memcpy OCC headers for same-interval candidates.
+			 * This forces the DRAM controller to pipeline N concurrent requests. */
+			for (j = 0; j < nj; ++j) {
+				if (ilv_same[j]) {
+					ilv_p[j] = bwt_occ_intv(bwt, ilv_k[j]);
+					memcpy(ilv_cntk[j], ilv_p[j], 4 * sizeof(bwtint_t));
+				}
+			}
+			/* Phase 0b: for slow-path candidates (different intervals), load both OCC headers */
+			for (j = 0; j < nj; ++j) {
+				if (!ilv_same[j]) {
+					ilv_p[j] = bwt_occ_intv(bwt, ilv_k[j]);
+					memcpy(ilv_cntk[j], ilv_p[j], 4 * sizeof(bwtint_t));
+					/* Also touch l's OCC interval if different */
+					if (ilv_l0[j] != (bwtint_t)(-1)) {
+						uint32_t *pl = bwt_occ_intv(bwt, ilv_l[j]);
+						volatile uint32_t dummy = *pl;
+						(void)dummy;
+					}
+				}
+			}
+
+			/* Phase 1: complete bwt_2occ4 computation + bwt_extend for each candidate. */
+			for (j = 0; j < nj; ++j) {
+				if (ilv_same[j]) {
+					/* Fast path: complete bwt_2occ4 using pre-loaded OCC header */
+					bwtint_t x, y;
+					uint32_t *p, tmp, *endk, *endl;
+					p = ilv_p[j] + sizeof(bwtint_t);
+					endk = p + ((ilv_k[j]>>4) - ((ilv_k[j]&~OCC_INTV_MASK)>>4));
+					endl = p + ((ilv_l[j]>>4) - ((ilv_l[j]&~OCC_INTV_MASK)>>4));
+					for (x = 0; p < endk; ++p) x += __occ_aux4(bwt, *p);
+					y = x;
+					tmp = *p & ~((1U<<((~ilv_k[j]&15)<<1)) - 1);
+					x += __occ_aux4(bwt, tmp) - (~ilv_k[j]&15);
+					for (; p < endl; ++p) y += __occ_aux4(bwt, *p);
+					tmp = *p & ~((1U<<((~ilv_l[j]&15)<<1)) - 1);
+					y += __occ_aux4(bwt, tmp) - (~ilv_l[j]&15);
+					ilv_tk[j][0] = ilv_cntk[j][0] + (x&0xff); ilv_tk[j][1] = ilv_cntk[j][1] + (x>>8&0xff);
+					ilv_tk[j][2] = ilv_cntk[j][2] + (x>>16&0xff); ilv_tk[j][3] = ilv_cntk[j][3] + (x>>24);
+					ilv_tl[j][0] = ilv_cntk[j][0] + (y&0xff); ilv_tl[j][1] = ilv_cntk[j][1] + (y>>8&0xff);
+					ilv_tl[j][2] = ilv_cntk[j][2] + (y>>16&0xff); ilv_tl[j][3] = ilv_cntk[j][3] + (y>>24);
+				} else {
+					/* Slow path: k/l in different intervals */
+					bwtint_t cntk_tmp[4], cntl_tmp[4];
+					bwt_2occ4(bwt, ilv_k0[j], ilv_l0[j], cntk_tmp, cntl_tmp);
+					memcpy(ilv_tk[j], cntk_tmp, 4 * sizeof(bwtint_t));
+					memcpy(ilv_tl[j], cntl_tmp, 4 * sizeof(bwtint_t));
+				}
+				/* Complete bwt_extend: compute ok[4] from tk/tl */
+				{
+					bwtintv_t *pik = &prev->a[j];
+					int ii;
+					for (ii = 0; ii != 4; ++ii) {
+						ilv_ok[j][ii].x[0] = bwt->L2[ii] + 1 + ilv_tk[j][ii]; /* x[!is_back]=x[0] */
+						ilv_ok[j][ii].x[2] = ilv_tl[j][ii] - ilv_tk[j][ii];
+					}
+					ilv_ok[j][3].x[1] = pik->x[1] + (pik->x[0] <= bwt->primary && pik->x[0] + pik->x[2] - 1 >= bwt->primary);
+					ilv_ok[j][2].x[1] = ilv_ok[j][3].x[1] + ilv_ok[j][3].x[2];
+					ilv_ok[j][1].x[1] = ilv_ok[j][2].x[1] + ilv_ok[j][2].x[2];
+					ilv_ok[j][0].x[1] = ilv_ok[j][1].x[1] + ilv_ok[j][1].x[2];
+				}
+			}
+
+			/* Phase 2: apply selection logic for interleaved + remaining candidates */
+			for (j = 0, curr->n = 0; j < prev->n; ++j) {
+				bwtintv_t *p = &prev->a[j];
+				if (j < nj) {
+					/* Use pre-computed ilv_ok */
+					bwtintv_t *ok_ptr = ilv_ok[j];
+					if (ok_ptr[c].x[2] < min_intv) {
+						if (curr->n == 0) {
+							if (mem->n == 0 || i + 1 < mem->a[mem->n-1].info>>32) {
+								ik = *p; ik.info |= (uint64_t)(i + 1)<<32;
+								kv_push(bwtintv_t, *mem, ik);
+							}
+						}
+					} else if (curr->n == 0 || ok_ptr[c].x[2] != curr->a[curr->n-1].x[2]) {
+						ilv_ok[j][c].info = p->info;
+						kv_push(bwtintv_t, *curr, ilv_ok[j][c]);
+					}
+				} else {
+					/* Remaining candidates beyond BWT_EXTEND_ILV_MAX: normal extend */
+					bwt_extend(bwt, p, ok, 1);
+					if (ok[c].x[2] < min_intv) {
+						if (curr->n == 0) {
+							if (mem->n == 0 || i + 1 < mem->a[mem->n-1].info>>32) {
+								ik = *p; ik.info |= (uint64_t)(i + 1)<<32;
+								kv_push(bwtintv_t, *mem, ik);
+							}
+						}
+					} else if (curr->n == 0 || ok[c].x[2] != curr->a[curr->n-1].x[2]) {
+						ok[c].info = p->info;
+						kv_push(bwtintv_t, *curr, ok[c]);
+					}
+				}
+			}
+		} else {
+			/* c < 0 or ik.x[2] < max_intv: no extend needed, original logic */
+			for (j = 0, curr->n = 0; j < prev->n; ++j) {
+				bwtintv_t *p = &prev->a[j];
+				if (curr->n == 0) {
+					if (mem->n == 0 || i + 1 < mem->a[mem->n-1].info>>32) {
+						ik = *p; ik.info |= (uint64_t)(i + 1)<<32;
+						kv_push(bwtintv_t, *mem, ik);
+					}
+				}
+			}
+		}
+#else
 		for (j = 0, curr->n = 0; j < prev->n; ++j) {
 			bwtintv_t *p = &prev->a[j];
 			if (c >= 0 && ik.x[2] >= max_intv) bwt_extend(bwt, p, ok, 1);
@@ -340,6 +490,7 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 				kv_push(bwtintv_t, *curr, ok[c]);
 			}
 		}
+#endif
 		if (curr->n == 0) break;
 		swap = curr; curr = prev; prev = swap;
 	}

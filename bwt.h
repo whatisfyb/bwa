@@ -85,6 +85,20 @@ typedef struct { size_t n, m; bwtintv_t *a; } bwtintv_v;
 extern "C" {
 #endif
 
+#ifdef OPT_BWT_EXTEND_INTERLEAVE
+/* M-12: Batch interleaved OCC header loading for bwt_smem1a backward search.
+ * In bwt_smem1a's inner loop, multiple candidates each call bwt_extend →
+ * bwt_2occ4, which loads OCC interval headers from DRAM. By loading all OCC
+ * headers in a tight Phase-0 loop (DRAM controller pipelines N requests),
+ * then completing each bwt_2occ4's loop computation in Phase 1, we overlap
+ * DRAM latency with other candidates' header loads.
+ * This follows the M-2 lesson: interleaving (execution order change) works,
+ * simple prefetch doesn't. The tight Phase-0 memcpy loop provides ~N*20ns
+ * window per candidate, enough for DRAM ~80ns when N>=4.
+ * BWT_EXTEND_ILV_MAX: max candidates to interleave per outer iteration. */
+#define BWT_EXTEND_ILV_MAX 8
+#endif
+
 	void bwt_dump_bwt(const char *fn, const bwt_t *bwt);
 	void bwt_dump_sa(const char *fn, const bwt_t *bwt);
 
