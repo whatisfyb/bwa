@@ -86,35 +86,45 @@ void bwt_cal_sa(bwt_t *bwt, int intv)
 bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 {
 	bwtint_t sa = 0, mask = bwt->sa_intv - 1;
+#ifdef OPT_PRFM_L2L3
+	/* K-5: Prefetch SA entry early. SA array has cross-query reuse —
+	 * nearby positions share sa_intv blocks. Getting it into L3 early
+	 * means the final lookup at the end of the loop hits L3 instead of DRAM.
+	 * SA is ~1.5GB so it's always a cache miss without prefetch. */
+	prfm_prefetch_l3keep(&bwt->sa[k / bwt->sa_intv]);
+#endif
 	while (k & mask) {
 #ifdef OPT_PRFM_L2L3
 		/* K-5: Prefetch OCC block for current iteration's bwt_invPsi call.
 		 * bwt_invPsi makes 2 random accesses (bwt_B0 + bwt_occ) into the
 		 * BWT array. Both accesses are within the same 64-byte OCC block,
-		 * so one PRFM PLDL2KEEP covers both. L2 is private per core (512KB)
-		 * and unaffected by Kunpeng L3 partition/shared mode issues.
-		 * L2 hit ~7ns vs DRAM ~80-120ns on Kunpeng 920. */
+		 * so one PRFM covers both.
+		 * Use PLDL3STRM: OCC blocks in bwt_sa are one-time use (scanned
+		 * once per invPsi step), so streaming L3 avoids polluting L2.
+		 * This preserves L2 space for truly reusable data. */
 		bwtint_t _k = k - (k >= bwt->primary);
-		prfm_prefetch_l2keep(bwt_occ_intv(bwt, _k));
+		prfm_prefetch_l3strm(bwt_occ_intv(bwt, _k));
 #endif
 
 		++sa;
 		k = bwt_invPsi(bwt, k);
 
 #ifdef OPT_PRFM_L2L3
-		/* K-5: Prefetch OCC block for NEXT iteration while current
-		 * computation is in flight (~20ns arithmetic window to cover
-		 * L2 prefetch latency). This creates a 2-stage pipeline:
-		 * iteration N computes while iteration N+1's data loads into L2. */
+		/* K-5: Pipeline — prefetch NEXT iteration's OCC block into L3
+		 * while current computation is in flight (~20ns arithmetic window
+		 * to cover L3 prefetch latency). Creates a 2-stage pipeline:
+		 * iteration N computes while iteration N+1's data loads into L3.
+		 * Use L3STRM: one-time scan data, don't pollute L2. */
 		if (k & mask) {
 			bwtint_t _next_k = k - (k >= bwt->primary);
-			prfm_prefetch_l3keep(bwt_occ_intv(bwt, _next_k));
+			prfm_prefetch_l3strm(bwt_occ_intv(bwt, _next_k));
 		}
 #endif
 	}
 #ifdef OPT_PRFM_L2L3
-	/* K-5: Prefetch SA entry for final lookup. SA array has cross-query
-	 * reuse locality (nearby positions share sa_intv blocks). */
+	/* K-5: SA entry should already be in L3 from the early prefetch above.
+	 * This second prefetch is a no-op if it's already there, but provides
+	 * insurance for short loops where the first prefetch hasn't completed. */
 	prfm_prefetch_l3keep(&bwt->sa[k / bwt->sa_intv]);
 #endif
 	return sa + bwt->sa[k/bwt->sa_intv];
@@ -202,9 +212,9 @@ void bwt_occ4(const bwt_t *bwt, bwtint_t k, bwtint_t cnt[4])
 	k -= (k >= bwt->primary); // because $ is not in bwt
 	p = bwt_occ_intv(bwt, k);
 #ifdef OPT_PRFM_L2L3
-	/* K-5: Prefetch OCC block into L2 before memcpy + scan.
-	 * OCC block is 64 bytes — one PRFM brings the whole block. */
-	prfm_prefetch_l2keep(p);
+	/* K-5: Use PLDL3STRM (streaming L3) for bwt_occ4's OCC block.
+	 * Same rationale as bwt_2occ4 — one-time scan data, don't pollute L2. */
+	prfm_prefetch_l3strm(p);
 #endif
 	memcpy(cnt, p, 4 * sizeof(bwtint_t));
 	p += sizeof(bwtint_t); // sizeof(bwtint_t) = 4*(sizeof(bwtint_t)/sizeof(uint32_t))
@@ -231,12 +241,15 @@ void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtin
 		l -= (l >= bwt->primary);
 		p = bwt_occ_intv(bwt, k);
 #ifdef OPT_PRFM_L2L3
-		/* K-5: Prefetch the 64-byte OCC block into L2 before scanning.
-		 * The memcpy + scan loop takes ~20-40ns, providing a computation
-		 * window that overlaps with the L2 prefetch latency.
-		 * PLDL2KEEP: retain in L2 for potential reuse by bwt_extend's
-		 * subsequent bwt_2occ4 calls on nearby positions. */
-		prfm_prefetch_l2keep(p);
+		/* K-5: Prefetch the 64-byte OCC block into L3 (streaming) before scanning.
+		 * Use PLDL3STRM instead of PLDL2KEEP because:
+		 * 1. bwt_2occ4's OCC block is scanned once and discarded — no reuse benefit
+		 *    from keeping in L2. L2KEEP would evict useful bwt_sa data from L2.
+		 * 2. PLDL3STRM hints the cache replacement policy to not retain the line,
+		 *    freeing L2 space for bwt_sa's L2-prefetched blocks.
+		 * 3. L3STRM still brings data into L3, so the subsequent memcpy/scan
+		 *    hits L3 (~36ns in partition mode) instead of DRAM (~80-120ns). */
+		prfm_prefetch_l3strm(p);
 #endif
 		memcpy(cntk, p, 4 * sizeof(bwtint_t));
 		p += sizeof(bwtint_t); // sizeof(bwtint_t) = 4*(sizeof(bwtint_t)/sizeof(uint32_t))
@@ -347,9 +360,9 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 			c = 3 - q[i]; // complement of q[i]
 #ifdef OPT_PRFM_L2L3
 			/* K-5: Prefetch OCC block for upcoming bwt_extend call.
-			 * bwt_extend -> bwt_2occ4 does random access into ~3.2GB BWT.
-			 * Prefetch the OCC block for position ik.x[0]-1 into L2. */
-			prfm_prefetch_l2keep(bwt_occ_intv(bwt, ik.x[0] - 1));
+			 * Use L3STRM: bwt_extend's OCC blocks are one-time scan,
+			 * streaming avoids polluting L2 cache. */
+			prfm_prefetch_l3strm(bwt_occ_intv(bwt, ik.x[0] - 1));
 #endif
 			bwt_extend(bwt, &ik, ok, 0);
 			if (ok[c].x[2] != ik.x[2]) { // change of the interval size
@@ -371,10 +384,9 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 		c = i < 0? -1 : q[i] < 4? q[i] : -1; // c==-1 if i<0 or q[i] is an ambiguous base
 #ifdef OPT_PRFM_L2L3
 		/* K-5: Prefetch OCC block for the first interval in backward search.
-		 * bwt_extend -> bwt_2occ4 is the dominant cost; prefetch the block
-		 * for prev->a[0]'s position into L2 before entering the j loop. */
+		 * Use L3STRM: one-time scan data for bwt_extend. */
 		if (c >= 0 && prev->n > 0) {
-			prfm_prefetch_l2keep(bwt_occ_intv(bwt, prev->a[0].x[1] - 1));
+			prfm_prefetch_l3strm(bwt_occ_intv(bwt, prev->a[0].x[1] - 1));
 		}
 #endif
 		for (j = 0, curr->n = 0; j < prev->n; ++j) {
@@ -419,8 +431,8 @@ int bwt_seed_strategy1(const bwt_t *bwt, int len, const uint8_t *q, int x, int m
 		if (q[i] < 4) { // an A/C/G/T base
 			c = 3 - q[i]; // complement of q[i]
 #ifdef OPT_PRFM_L2L3
-			/* K-5: Prefetch OCC block for bwt_extend call */
-			prfm_prefetch_l2keep(bwt_occ_intv(bwt, ik.x[0] - 1));
+			/* K-5: Prefetch OCC block for bwt_extend call (streaming L3) */
+			prfm_prefetch_l3strm(bwt_occ_intv(bwt, ik.x[0] - 1));
 #endif
 			bwt_extend(bwt, &ik, ok, 0);
 			if (ok[c].x[2] < max_intv && i - x >= min_len) {
