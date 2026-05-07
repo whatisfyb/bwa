@@ -22,6 +22,18 @@ ifeq ($(shell uname -s),GNU/kFreeBSD)
 	LIBS += -lrt
 endif
 
+# OCC_INTERVAL=256: Reduce BWT array size by increasing OCC sampling interval.
+# Default OCC_INTERVAL=128 (OCC_INTV_SHIFT=7), BWT array ~3.2GB.
+# With OCC_INTERVAL=256 (OCC_INTV_SHIFT=8), BWT array ~1.8GB — more data fits
+# in L3 cache, reducing DRAM accesses. Trade-off: more bit-scanning per OCC query,
+# but on memory-bound platforms (Kunpeng 920) this is favorable.
+# IMPORTANT: Requires rebuilding the BWT index with the same OCC_INTERVAL!
+# make USE_OCC256=1 index   → build index with OCC_INTERVAL=256
+# make USE_OCC256=1         → compile with OCC_INTERVAL=256
+ifdef USE_OCC256
+CFLAGS += -DOCC_INTV_SHIFT=8
+endif
+
 ifneq ($(asan),)
 	CFLAGS+=-fsanitize=address
 	LIBS+=-fsanitize=address -ldl

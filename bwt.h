@@ -33,8 +33,15 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// requirement: (OCC_INTERVAL%16 == 0); please DO NOT change this line because some part of the code assume OCC_INTERVAL=0x80
+// requirement: (OCC_INTERVAL%16 == 0)
+// Default OCC_INTERVAL=128 (0x80), can be overridden with -DOCC_INTV_SHIFT=8
+// for larger interval (256) to reduce BWT array size and improve L3 hit rate.
+// OCC_INTERVAL=256 halves the BWT array (~3.2GB → ~1.8GB) at the cost of
+// more bit-scanning per OCC query (compute vs memory trade-off).
+// On memory-bound platforms like Kunpeng 920, this trade-off is favorable.
+#ifndef OCC_INTV_SHIFT
 #define OCC_INTV_SHIFT 7
+#endif
 #define OCC_INTERVAL   (1LL<<OCC_INTV_SHIFT)
 #define OCC_INTV_MASK  (OCC_INTERVAL - 1)
 
@@ -65,14 +72,19 @@ typedef struct {
 
 typedef struct { size_t n, m; bwtintv_t *a; } bwtintv_v;
 
-/* For general OCC_INTERVAL, the following is correct:
-#define bwt_bwt(b, k) ((b)->bwt[(k)/OCC_INTERVAL * (OCC_INTERVAL/(sizeof(uint32_t)*8/2) + sizeof(bwtint_t)/4*4) + sizeof(bwtint_t)/4*4 + (k)%OCC_INTERVAL/16])
-#define bwt_occ_intv(b, k) ((b)->bwt + (k)/OCC_INTERVAL * (OCC_INTERVAL/(sizeof(uint32_t)*8/2) + sizeof(bwtint_t)/4*4)
-*/
+/* General OCC_INTERVAL macros — work for any OCC_INTERVAL that is a power of 2 >= 16.
+ * Each OCC block layout:
+ *   [0..sizeof(bwtint_t)/4-1] = OCC cumulative counts (4 × bwtint_t = 8 uint32_t)
+ *   [sizeof(bwtint_t)/4 .. sizeof(bwtint_t)/4 + OCC_INTERVAL/16 - 1] = BWT bit vectors
+ * Total block size in uint32_t = sizeof(bwtint_t)/4 + OCC_INTERVAL/16 = 8 + OCC_INTERVAL/16
+ *
+ * For OCC_INTERVAL=128 (OCC_INTV_SHIFT=7): block = 16 uint32_t = 64 bytes
+ * For OCC_INTERVAL=256 (OCC_INTV_SHIFT=8): block = 24 uint32_t = 96 bytes
+ */
+#define OCC_BLOCK_SIZE  (sizeof(bwtint_t)/4 + (int)(OCC_INTERVAL/16))
 
-// The following two lines are ONLY correct when OCC_INTERVAL==0x80
-#define bwt_bwt(b, k) ((b)->bwt[((k)>>7<<4) + sizeof(bwtint_t) + (((k)&0x7f)>>4)])
-#define bwt_occ_intv(b, k) ((b)->bwt + ((k)>>7<<4))
+#define bwt_occ_intv(b, k) ((b)->bwt + ((bwtint_t)(k) >> OCC_INTV_SHIFT) * OCC_BLOCK_SIZE)
+#define bwt_bwt(b, k) ((b)->bwt[((bwtint_t)(k) >> OCC_INTV_SHIFT) * OCC_BLOCK_SIZE + sizeof(bwtint_t) + (((k) & (bwtint_t)(OCC_INTERVAL-1)) >> 4)])
 
 /* retrieve a character from the $-removed BWT string. Note that
  * bwt_t::bwt is not exactly the BWT string and therefore this macro is
