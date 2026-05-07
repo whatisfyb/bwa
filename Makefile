@@ -22,6 +22,17 @@ ifeq ($(shell uname -s),GNU/kFreeBSD)
 	LIBS += -lrt
 endif
 
+# K-5: ARM PRFM L2/L3 prefetch (replaces __builtin_prefetch which targets L1)
+# On ARM: generates explicit PRFM PLDL2KEEP/PLDL3KEEP instructions via inline asm
+# On x86: generates PREFETCHT1 instructions via __builtin_prefetch(addr,0,1)
+# Key insight: BWT OCC data (~3.2GB) cannot stay in L1 (64KB), so prefetching
+# to L1 is wasteful. Prefetching to L2 (512KB) or L3 keeps data accessible
+# with lower latency than DRAM (~7ns L2 vs ~80-120ns DRAM).
+# Recommended on Kunpeng 920: make USE_PRFM_L2L3=1
+ifdef USE_PRFM_L2L3
+CFLAGS += -DOPT_PRFM_L2L3
+endif
+
 ifneq ($(asan),)
 	CFLAGS+=-fsanitize=address
 	LIBS+=-fsanitize=address -ldl

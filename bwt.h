@@ -82,7 +82,58 @@ typedef struct { size_t n, m; bwtintv_t *a; } bwtintv_v;
 #define bwt_set_intv(bwt, c, ik) ((ik).x[0] = (bwt)->L2[(int)(c)]+1, (ik).x[2] = (bwt)->L2[(int)(c)+1]-(bwt)->L2[(int)(c)], (ik).x[1] = (bwt)->L2[3-(c)]+1, (ik).info = 0)
 
 #ifdef __cplusplus
-extern "C" {
+ extern "C" {
+#endif
+
+/* K-5: PRFM L2/L3 prefetch helper macros for Kunpeng 920 ARM optimization
+ *
+ * Problem: __builtin_prefetch(addr, 0, 1) on ARM maps to PRFM PLDL1KEEP
+ * (prefetch into L1 data cache). BWT OCC data (~3.2GB for GRCh38) far
+ * exceeds L1 capacity (64KB), so L1 prefetches are immediately evicted.
+ * On Kunpeng 920, L2 is 512KB/core and L3 is ~4MB per CCL partition —
+ * these levels can actually retain prefetched OCC blocks.
+ *
+ * Solution: On ARM, use inline asm to emit PRFM instructions targeting
+ * L2 (PLDL2KEEP) and L3 (PLDL3KEEP/PLDL3STRM). On x86, use
+ * __builtin_prefetch with locality=1 which maps to PREFETCHT1 (L2/L3).
+ *
+ * PRFM variants:
+ *   PLDL2KEEP  — prefetch to L2, retain (best for data reused within
+ *                same bwt_sa/bwt_2occ4 call, ~7ns L2 hit latency)
+ *   PLDL3KEEP  — prefetch to L3, retain (best for data reused across
+ *                multiple calls, e.g. SA array, ~36ns private L3 latency)
+ *   PLDL3STRM  — prefetch to L3, streaming/non-temporal (best for
+ *                one-time-use data like BWT OCC blocks that won't be
+ *                revisited, avoids polluting L3 capacity)
+ *
+ * IMPORTANT: On Kunpeng 920, L3 runs in partition mode by default.
+ * When multiple threads share bwt_t data, L3 enters shared mode with
+ * >90 cycle latency. PRFM PLDL2KEEP targets L2 which is private per
+ * core and unaffected by L3 mode — making it the most reliable target.
+ */
+#ifdef OPT_PRFM_L2L3
+ #if defined(__aarch64__) || defined(__ARM_NEON)
+  /* ARM64: explicit PRFM instructions via inline asm */
+  #define prfm_prefetch_l2keep(addr) \
+  	__asm__ volatile("prfm pldl2keep, [%0]" :: "r"(addr))
+  #define prfm_prefetch_l3keep(addr) \
+  	__asm__ volatile("prfm pldl3keep, [%0]" :: "r"(addr))
+  #define prfm_prefetch_l3strm(addr) \
+  	__asm__ volatile("prfm pldl3strm, [%0]" :: "r"(addr))
+ #else
+  /* x86: __builtin_prefetch with locality=1 → PREFETCHT1 (L2/L3) */
+  #define prfm_prefetch_l2keep(addr) \
+  	__builtin_prefetch(addr, 0, 1)
+  #define prfm_prefetch_l3keep(addr) \
+  	__builtin_prefetch(addr, 0, 1)
+  #define prfm_prefetch_l3strm(addr) \
+  	__builtin_prefetch(addr, 0, 0)
+ #endif
+#else
+ /* No PRFM prefetch — macros expand to nothing */
+ #define prfm_prefetch_l2keep(addr)  ((void)0)
+ #define prfm_prefetch_l3keep(addr)  ((void)0)
+ #define prfm_prefetch_l3strm(addr) ((void)0)
 #endif
 
 	void bwt_dump_bwt(const char *fn, const bwt_t *bwt);

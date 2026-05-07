@@ -87,11 +87,36 @@ bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 {
 	bwtint_t sa = 0, mask = bwt->sa_intv - 1;
 	while (k & mask) {
+#ifdef OPT_PRFM_L2L3
+		/* K-5: Prefetch OCC block for current iteration's bwt_invPsi call.
+		 * bwt_invPsi makes 2 random accesses (bwt_B0 + bwt_occ) into the
+		 * BWT array. Both accesses are within the same 64-byte OCC block,
+		 * so one PRFM PLDL2KEEP covers both. L2 is private per core (512KB)
+		 * and unaffected by Kunpeng L3 partition/shared mode issues.
+		 * L2 hit ~7ns vs DRAM ~80-120ns on Kunpeng 920. */
+		bwtint_t _k = k - (k >= bwt->primary);
+		prfm_prefetch_l2keep(bwt_occ_intv(bwt, _k));
+#endif
+
 		++sa;
 		k = bwt_invPsi(bwt, k);
+
+#ifdef OPT_PRFM_L2L3
+		/* K-5: Prefetch OCC block for NEXT iteration while current
+		 * computation is in flight (~20ns arithmetic window to cover
+		 * L2 prefetch latency). This creates a 2-stage pipeline:
+		 * iteration N computes while iteration N+1's data loads into L2. */
+		if (k & mask) {
+			bwtint_t _next_k = k - (k >= bwt->primary);
+			prfm_prefetch_l3keep(bwt_occ_intv(bwt, _next_k));
+		}
+#endif
 	}
-	/* without setting bwt->sa[0] = -1, the following line should be
-	   changed to (sa + bwt->sa[k/bwt->sa_intv]) % (bwt->seq_len + 1) */
+#ifdef OPT_PRFM_L2L3
+	/* K-5: Prefetch SA entry for final lookup. SA array has cross-query
+	 * reuse locality (nearby positions share sa_intv blocks). */
+	prfm_prefetch_l3keep(&bwt->sa[k / bwt->sa_intv]);
+#endif
 	return sa + bwt->sa[k/bwt->sa_intv];
 }
 
@@ -176,6 +201,11 @@ void bwt_occ4(const bwt_t *bwt, bwtint_t k, bwtint_t cnt[4])
 	}
 	k -= (k >= bwt->primary); // because $ is not in bwt
 	p = bwt_occ_intv(bwt, k);
+#ifdef OPT_PRFM_L2L3
+	/* K-5: Prefetch OCC block into L2 before memcpy + scan.
+	 * OCC block is 64 bytes — one PRFM brings the whole block. */
+	prfm_prefetch_l2keep(p);
+#endif
 	memcpy(cnt, p, 4 * sizeof(bwtint_t));
 	p += sizeof(bwtint_t); // sizeof(bwtint_t) = 4*(sizeof(bwtint_t)/sizeof(uint32_t))
 	end = p + ((k>>4) - ((k&~OCC_INTV_MASK)>>4)); // this is the end point of the following loop
@@ -200,6 +230,14 @@ void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtin
 		k -= (k >= bwt->primary); // because $ is not in bwt
 		l -= (l >= bwt->primary);
 		p = bwt_occ_intv(bwt, k);
+#ifdef OPT_PRFM_L2L3
+		/* K-5: Prefetch the 64-byte OCC block into L2 before scanning.
+		 * The memcpy + scan loop takes ~20-40ns, providing a computation
+		 * window that overlaps with the L2 prefetch latency.
+		 * PLDL2KEEP: retain in L2 for potential reuse by bwt_extend's
+		 * subsequent bwt_2occ4 calls on nearby positions. */
+		prfm_prefetch_l2keep(p);
+#endif
 		memcpy(cntk, p, 4 * sizeof(bwtint_t));
 		p += sizeof(bwtint_t); // sizeof(bwtint_t) = 4*(sizeof(bwtint_t)/sizeof(uint32_t))
 		// prepare cntk[]
@@ -307,6 +345,12 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 			break;
 		} else if (q[i] < 4) { // an A/C/G/T base
 			c = 3 - q[i]; // complement of q[i]
+#ifdef OPT_PRFM_L2L3
+			/* K-5: Prefetch OCC block for upcoming bwt_extend call.
+			 * bwt_extend -> bwt_2occ4 does random access into ~3.2GB BWT.
+			 * Prefetch the OCC block for position ik.x[0]-1 into L2. */
+			prfm_prefetch_l2keep(bwt_occ_intv(bwt, ik.x[0] - 1));
+#endif
 			bwt_extend(bwt, &ik, ok, 0);
 			if (ok[c].x[2] != ik.x[2]) { // change of the interval size
 				kv_push(bwtintv_t, *curr, ik);
@@ -325,6 +369,14 @@ int bwt_smem1a(const bwt_t *bwt, int len, const uint8_t *q, int x, int min_intv,
 
 	for (i = x - 1; i >= -1; --i) { // backward search for MEMs
 		c = i < 0? -1 : q[i] < 4? q[i] : -1; // c==-1 if i<0 or q[i] is an ambiguous base
+#ifdef OPT_PRFM_L2L3
+		/* K-5: Prefetch OCC block for the first interval in backward search.
+		 * bwt_extend -> bwt_2occ4 is the dominant cost; prefetch the block
+		 * for prev->a[0]'s position into L2 before entering the j loop. */
+		if (c >= 0 && prev->n > 0) {
+			prfm_prefetch_l2keep(bwt_occ_intv(bwt, prev->a[0].x[1] - 1));
+		}
+#endif
 		for (j = 0, curr->n = 0; j < prev->n; ++j) {
 			bwtintv_t *p = &prev->a[j];
 			if (c >= 0 && ik.x[2] >= max_intv) bwt_extend(bwt, p, ok, 1);
@@ -366,6 +418,10 @@ int bwt_seed_strategy1(const bwt_t *bwt, int len, const uint8_t *q, int x, int m
 	for (i = x + 1; i < len; ++i) { // forward search
 		if (q[i] < 4) { // an A/C/G/T base
 			c = 3 - q[i]; // complement of q[i]
+#ifdef OPT_PRFM_L2L3
+			/* K-5: Prefetch OCC block for bwt_extend call */
+			prfm_prefetch_l2keep(bwt_occ_intv(bwt, ik.x[0] - 1));
+#endif
 			bwt_extend(bwt, &ik, ok, 0);
 			if (ok[c].x[2] < max_intv && i - x >= min_len) {
 				*mem = ok[c];
